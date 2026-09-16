@@ -53,6 +53,27 @@ def health():
     return {"status": "ok", **_status}
 
 
+@app.route("/test-email")
+def test_email():
+    """Изпраща тестов email алърт през Resend, за да провериш дали
+    ALERT_EMAIL_ENABLED/RESEND_API_KEY/ALERT_EMAIL_TO са настроени правилно.
+    Просто отвори този URL в браузъра веднъж."""
+    from scoring import ScoreResult
+    fake = ScoreResult(
+        symbol="TEST",
+        score=99,
+        reasons=["Това е тестов алърт за проверка на Resend интеграцията."],
+        has_catalyst=True,
+        raw={"price": 1.23},
+    )
+    send_alert("ТЕСТ", fake)
+    if not config.ALERT_EMAIL_ENABLED:
+        return {"sent": False, "reason": "ALERT_EMAIL_ENABLED е false - провери Render Environment Variables."}
+    if not config.RESEND_API_KEY:
+        return {"sent": False, "reason": "RESEND_API_KEY липсва - провери Render Environment Variables."}
+    return {"sent": True, "to": config.ALERT_EMAIL_TO, "note": "Провери логовете (Logs таб) и пощата си."}
+
+
 def _has_news_catalyst(symbol: str) -> bool:
     news = alpaca.get_news(symbol, limit=5) or finnhub.company_news(symbol, days_back=2) or fmp.stock_news(symbol, limit=5)
     return bool(news)
