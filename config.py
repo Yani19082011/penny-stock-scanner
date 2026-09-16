@@ -44,7 +44,12 @@ MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "300000000"))
 # Колко кандидата максимум да проверяваме през Finnhub на едно пълно
 # сканиране (пести безплатния rate limit на Finnhub, ~60 заявки/мин).
 MAX_MOVERS_CANDIDATES = int(os.getenv("MAX_MOVERS_CANDIDATES", "60"))
-WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "5"))
+# Вдигнато от 5 на 20 по избор на потребителя ("да следи колкото може повече") -
+# технически няма проблем: Alpaca/Finnhub rate limit-ите остават далеч под
+# капацитета им дори при 20 едновременно следени тикера. Реалният брой имейл
+# алърти пак е ограничен от MAX_EMAILS_PER_DAY - по-големият watchlist просто
+# означава повече кандидати се следят/логват, не повече спам.
+WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "20"))
 # Пълно сканиране на целия universe (нови кандидати) - по-тежко, по-рядко.
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "10"))
 # Бърз цикъл - прескорира само вече наблюдаваните 5 тикера, за реално-времеви
@@ -75,6 +80,18 @@ MIN_EMAIL_INTERVAL_SECONDS = int(os.getenv("MIN_EMAIL_INTERVAL_SECONDS", "300"))
 # По-малка част от общата дневна квота от 100 (споделена с memecoin бота) -
 # там пращаме 90/ден, тук само 10/ден (watchlist-ът е малък, не му трябва повече).
 MAX_EMAILS_PER_DAY = int(os.getenv("MAX_EMAILS_PER_DAY", "10"))
+
+# --- "Тихи часове" за имейл алъртите - потребителят иска имейли САМО между
+# 07:30 и 23:00 местно време (не иска да го буди бот през нощта). Прилага се
+# само върху ИЗПРАЩАНЕТО на email - алъртите пак се логват в Render Logs
+# денонощно. Извън тези часове main.py и без друго не сканира (пазарът е
+# затворен), но границата тук е допълнителна защита + важи за всеки edge
+# case (напр. ръчно повикан /test-email по всяко време на денонощието). ---
+ALERT_QUIET_HOURS_TZ = os.getenv("ALERT_QUIET_HOURS_TZ", "Europe/Sofia")
+ALERT_ACTIVE_START_HOUR = int(os.getenv("ALERT_ACTIVE_START_HOUR", "7"))
+ALERT_ACTIVE_START_MINUTE = int(os.getenv("ALERT_ACTIVE_START_MINUTE", "30"))
+ALERT_ACTIVE_END_HOUR = int(os.getenv("ALERT_ACTIVE_END_HOUR", "23"))
+ALERT_ACTIVE_END_MINUTE = int(os.getenv("ALERT_ACTIVE_END_MINUTE", "0"))
 
 # --- Render (или локален) HTTP порт за health-check ---
 PORT = int(os.getenv("PORT", "10000"))
