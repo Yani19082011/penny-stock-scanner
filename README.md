@@ -73,17 +73,26 @@ tier-ове на Finnhub/FMP не покриват дълбока историч
 4. Отиди в Railway → твоя service → **Variables** таб и добави същите ключове като в `.env` (ALPACA_API_KEY, ALPACA_SECRET_KEY, FINNHUB_API_KEY, FMP_API_KEY, и т.н.). **Никога не commit-вай `.env` файла** — `.gitignore`-ът вече го изключва.
 5. Railway → Deployments → Logs, за да видиш дали цикълът тръгва и дали има грешки.
 
-## 4. Email алърти (след като свържеш Gmail connector в Claude чата)
+## 4. Email алърти през Resend (не Gmail SMTP)
 
-1. В Gmail акаунта: Google Account → Security → "App passwords" → генерирай нов app password (изисква включен 2-Step Verification).
-2. В Railway Variables (или локален `.env`):
+Gmail "App Passwords" не работят на Family Link (supervised) акаунти, затова
+ползваме [Resend](https://resend.com) — безплатна услуга, праща email през
+обикновен HTTP API с ключ, без нужда от App Password/2FA проблеми.
+
+1. Регистрирай се безплатно на resend.com (може със същия имейл, на който
+   искаш да получаваш алъртите — напр. `yani.kolev2011@gmail.com`).
+2. Dashboard → **API Keys** → **Create API Key** → копирай ключа (показва се само веднъж).
+3. В Render → Environment таб (или локален `.env`):
    ```
    ALERT_EMAIL_ENABLED=true
-   SMTP_USERNAME=твоя-имейл@gmail.com
-   SMTP_APP_PASSWORD=<app password, не обикновената парола>
+   RESEND_API_KEY=<копирания ключ>
+   RESEND_FROM_EMAIL=onboarding@resend.dev
    ALERT_EMAIL_TO=yani.kolev2011@gmail.com
    ```
-3. Redeploy — оттук нататък алъртите за "висок потенциал" отиват и по имейл, не само в логовете.
+   **Важно:** без верифициран собствен домейн в Resend, безплатният `onboarding@resend.dev`
+   подател може да праща само до имейла, с който си се регистрирал в Resend —
+   затова `ALERT_EMAIL_TO` трябва да съвпада с него.
+4. Redeploy — оттук нататък алъртите за "висок потенциал" отиват и по имейл, не само в логовете.
 
 ## Структура на проекта
 

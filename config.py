@@ -42,10 +42,11 @@ TARGET_PROFIT_PCT = TARGET_PROFIT_EUR / POSITION_SIZE_EUR  # 0.25 по подр�
 
 # --- Email алърти ---
 ALERT_EMAIL_ENABLED = _bool("ALERT_EMAIL_ENABLED", False)
-SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USERNAME = os.getenv("SMTP_USERNAME", "")
-SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")
+# --- Resend (https://resend.com) - изпраща email през HTTP API, не през Gmail SMTP.
+# Ползваме го вместо Gmail App Password, защото Family Link/supervised Google
+# акаунти не позволяват App Passwords изобщо. Виж README.md за регистрация.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
 ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "yani.kolev2011@gmail.com")
 
 # --- Render (или локален) HTTP порт за health-check ---
