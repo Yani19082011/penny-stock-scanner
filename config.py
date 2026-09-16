@@ -27,7 +27,11 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 
 # --- Watchlist / universe ---
-MAX_UNIVERSE_PRICE = float(os.getenv("MAX_UNIVERSE_PRICE", "20"))
+MAX_UNIVERSE_PRICE = float(os.getenv("MAX_UNIVERSE_PRICE", "10"))
+# Горен праг на пазарна капитализация - за да са РЕАЛНИ penny stocks (малки,
+# спекулативни компании), не просто големи имена (MARA, NIO, F, AMC...),
+# които случайно търгуват евтино. $300M е стандартна граница за "micro-cap".
+MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "300000000"))
 WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "5"))
 # Пълно сканиране на целия universe (нови кандидати) - по-тежко, по-рядко.
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "10"))
