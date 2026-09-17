@@ -89,16 +89,22 @@ _previous_halts: dict = {}
 _recently_resumed: dict = {}
 
 
-def get_current_halts() -> dict:
+def get_current_halts() -> dict | None:
     """{symbol: {...halt info...}} за всички текущо спрени тикери в момента.
-    Празен dict при грешка/липса на данни - НИКОГА не гърми извикващия код."""
+    None (НЕ {}) при грешка/липса на данни от заявката - НИКОГА не гърми
+    извикващия код, но виж get_recently_resumed() за защо разликата между
+    "None = заявката падна" и "{} = реално няма спрени тикери" е важна: ако
+    върнехме {} и при мрежова грешка, get_recently_resumed() би изтълкувал
+    ВСЕКИ преди това спрян тикер като "току-що възобновен" (защото не се
+    вижда вече в текущия списък) - фалшив catalyst сигнал само заради
+    временна грешка в заявката, не заради реално възобновяване."""
     try:
         r = requests.get(NYSE_CURRENT_HALTS_URL, headers=_BROWSER_HEADERS, timeout=10)
         r.raise_for_status()
         data = r.json()
     except Exception as e:
         log.warning("NYSE halts fail: %s", e)
-        return {}
+        return None
 
     # defensively - пробваме познатата схема, после разумни fallback-и, ако
     # NYSE променят формата междувременно.
@@ -146,6 +152,20 @@ def get_recently_resumed() -> dict:
 
     current = get_current_halts()
     now = time.time()
+
+    if current is None:
+        # Заявката към NYSE се провали тази обиколка - НЕ пипаме
+        # _previous_halts и НЕ смятаме diff (виж коментара в
+        # get_current_halts() за защо: иначе всеки преди спрян тикер би
+        # изглеждал "току-що възобновен" само заради мрежова грешка).
+        # Просто изчистваме изтеклите записи и връщаме каквото вече знаем.
+        log.debug("NYSE halts заявката се провали - пропускам resume-diff тази обиколка.")
+        cutoff = now - RESUME_SIGNAL_WINDOW_MINUTES * 60
+        _recently_resumed = {
+            symbol: info for symbol, info in _recently_resumed.items()
+            if info.get("resumed_at", 0) >= cutoff
+        }
+        return dict(_recently_resumed)
 
     resumed_now = [symbol for symbol in _previous_halts if symbol not in current]
     for symbol in resumed_now:

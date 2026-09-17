@@ -41,6 +41,54 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
+# --- Стартова самопроверка ---
+# Виж същата защита в MemecoinScanner/main.py - реален случай (17.09) там:
+# стар/непълен config.py караше score_token() да гърми тихо за ВСЯКА
+# монета, часове наред, без ботът да покаже ясна грешка (health-check-ът
+# минаваше нормално). Тук прилагаме същия принцип превантивно, за да не се
+# повтори същият клас бъг и в penny-stock бота.
+REQUIRED_CONFIG_ATTRS = [
+    "MAX_UNIVERSE_PRICE", "MAX_MARKET_CAP_USD", "MAX_MOVERS_CANDIDATES",
+    "WATCHLIST_SIZE", "PREMARKET_START_HOUR", "PREMARKET_START_MINUTE",
+    "SCAN_INTERVAL_MINUTES", "FAST_INTERVAL_MINUTES",
+    "MIN_HIGH_POTENTIAL_CONFIRMATIONS", "PEAK_DRAWDOWN_STOP_PCT",
+    "POSITION_SIZE_EUR", "TARGET_PROFIT_EUR", "TARGET_PROFIT_PCT",
+    "ALERT_EMAIL_ENABLED", "RESEND_API_KEY", "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO",
+    "MIN_EMAIL_INTERVAL_SECONDS", "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT",
+]
+
+
+def _startup_self_check():
+    missing = [name for name in REQUIRED_CONFIG_ATTRS if not hasattr(config, name)]
+    if missing:
+        log.critical(
+            "СТАРТОВА ПРОВЕРКА ПРОВАЛЕНА: config.py липсват настройки: %s. "
+            "Най-вероятно файлът (локално или на Render) е стара/непълна версия - "
+            "провери git push/pull и redeploy-ни. Спирам стартирането, вместо да "
+            "оставя бота да сканира тихо счупен.",
+            ", ".join(missing),
+        )
+        raise SystemExit(1)
+
+    fake_ind = {
+        "price": 3.5, "ema9": 3.4, "ema20": 3.2, "vwap": 3.3, "rsi14": 60.0,
+        "relative_volume": 4.0, "trend_up": True, "above_vwap": True,
+        "orb_breakout": "bullish", "support": 3.0, "resistance": 3.8, "bullish_candle": True,
+    }
+    try:
+        score_symbol("SELFTEST", fake_ind, True, {"has_recent_dilution_filing": False})
+    except Exception as e:
+        log.critical(
+            "СТАРТОВА ПРОВЕРКА ПРОВАЛЕНА: score_symbol() гърми на синтетичен тест "
+            "(%s) - има бъг/несъответствие между config.py и scoring.py. Спирам "
+            "стартирането, вместо да оставя бота да сканира тихо счупен.",
+            e,
+        )
+        raise SystemExit(1)
+
+    log.info("Стартова самопроверка: config.py и scoring.py изглеждат съвместими.")
+
+
 alpaca = AlpacaClient()
 finnhub = FinnhubClient()
 fmp = FMPClient()
@@ -247,6 +295,7 @@ def _scan_loop():
 
 
 def main():
+    _startup_self_check()
     thread = threading.Thread(target=_scan_loop, daemon=True)
     thread.start()
     app.run(host="0.0.0.0", port=config.PORT)
