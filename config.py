@@ -50,11 +50,30 @@ MAX_MOVERS_CANDIDATES = int(os.getenv("MAX_MOVERS_CANDIDATES", "60"))
 # алърти пак е ограничен от MAX_EMAILS_PER_DAY - по-големият watchlist просто
 # означава повече кандидати се следят/логват, не повече спам.
 WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "20"))
+
+# Ботът вече сканира и в pre-market (по избор на потребителя), не само
+# редовна сесия. По подразбиране pre-market започва 4:00 ET (стандартното
+# начало за US борсите) - виж main.py _is_market_hours(). ВНИМАНИЕ: Alpaca
+# безплатният IEX feed има много по-тънки данни през pre-market (виж
+# коментара в main.py) - количеството кандидати може да е по-слабо.
+PREMARKET_START_HOUR = int(os.getenv("PREMARKET_START_HOUR", "4"))
+PREMARKET_START_MINUTE = int(os.getenv("PREMARKET_START_MINUTE", "0"))
+
 # Пълно сканиране на целия universe (нови кандидати) - по-тежко, по-рядко.
 SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "10"))
 # Бърз цикъл - прескорира само вече наблюдаваните 5 тикера, за реално-времеви
 # алърти без да чакаме следващото пълно сканиране.
 FAST_INTERVAL_MINUTES = int(os.getenv("FAST_INTERVAL_MINUTES", "2"))
+
+# --- Защита срещу "купуване на върха" (същия проблем, докладван при
+# memecoin бота на 17.09 - алърт точно на върха на кратък spike, цената
+# пада веднага след получаване на имейла). Изисква score-ът да е над
+# прага при поне MIN_HIGH_POTENTIAL_CONFIRMATIONS последователни проверки
+# (fast check на всеки FAST_INTERVAL_MINUTES) - не само на самия първи
+# spike - и че цената не е вече паднала над PEAK_DRAWDOWN_STOP_PCT% от
+# най-високата видяна цена, откакто следим тикера. ---
+MIN_HIGH_POTENTIAL_CONFIRMATIONS = int(os.getenv("MIN_HIGH_POTENTIAL_CONFIRMATIONS", "2"))
+PEAK_DRAWDOWN_STOP_PCT = float(os.getenv("PEAK_DRAWDOWN_STOP_PCT", "5"))
 
 # --- Позициониране (само за информативния текст в алъртите - не изпълнява поръчки) ---
 POSITION_SIZE_EUR = float(os.getenv("POSITION_SIZE_EUR", "20"))
@@ -72,11 +91,12 @@ ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "yani.kolev2011@gmail.com")
 
 # --- Anti-spam защита за Resend дневната квота (безплатен tier = 100 имейла/ден
 # за целия акаунт, споделен с другите ботове, ползващи същия RESEND_API_KEY) ---
-# Не пращаме имейл по-често от веднъж на MIN_EMAIL_INTERVAL_SECONDS (300с = 5мин,
-# значи максимум ~2 имейла на всеки 10 минути), плюс твърд дневен таван като
-# резерва под истинския лимит на Resend. Алъртът винаги се вижда в Render Logs -
-# само самото email изпращане се прескача, ако сме над темпото.
-MIN_EMAIL_INTERVAL_SECONDS = int(os.getenv("MIN_EMAIL_INTERVAL_SECONDS", "300"))
+# Не пращаме имейл по-често от веднъж на MIN_EMAIL_INTERVAL_SECONDS (420с =
+# 7 мин, по избор на потребителя от 17.09 - "по 1 койн на всеки 7-8 минути"),
+# плюс твърд дневен таван като резерва под истинския лимит на Resend.
+# Алъртът винаги се вижда в Render Logs - само самото email изпращане се
+# прескача, ако сме над темпото.
+MIN_EMAIL_INTERVAL_SECONDS = int(os.getenv("MIN_EMAIL_INTERVAL_SECONDS", "420"))
 # По-малка част от общата дневна квота от 100 (споделена с memecoin бота) -
 # там пращаме 90/ден, тук само 10/ден (watchlist-ът е малък, не му трябва повече).
 MAX_EMAILS_PER_DAY = int(os.getenv("MAX_EMAILS_PER_DAY", "10"))

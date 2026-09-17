@@ -88,6 +88,29 @@ class FinnhubClient:
         return (data or {}).get("data", [])
 
 
+def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", limit: int = 100) -> pd.DataFrame:
+    """Fallback източник, когато Alpaca IEX връща твърде малко свещи -
+    типично през pre-market (IEX сам по себе си покрива само ~2.5% от обема
+    на пазара по документацията на Alpaca), но и през редовна сесия при
+    силно неликвидни penny stocks. yfinance е напълно БЕЗПЛАТЕН, без API
+    ключ, и обхваща консолидирани данни от повече борси (не само IEX),
+    включително pre/post market с prepost=True. Забавянето спрямо реално
+    време е типично няколко минути - не е "истински" real-time като платен
+    feed, но е много по-пълен от самостоятелния безплатен IEX feed."""
+    try:
+        import yfinance as yf
+        df = yf.Ticker(symbol).history(period=period, interval=interval, prepost=True)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={
+            "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
+        })
+        return df[["open", "high", "low", "close", "volume"]].tail(limit)
+    except Exception as e:
+        log.warning("yfinance bars fail за %s: %s", symbol, e)
+        return pd.DataFrame()
+
+
 class FMPClient:
     BASE = "https://financialmodelingprep.com/stable"
 

@@ -21,12 +21,14 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import schedule
 from flask import Flask
 
 import config
-from data_sources import AlpacaClient, FinnhubClient, FMPClient, get_sec_dilution_flags
+from data_sources import AlpacaClient, FinnhubClient, FMPClient, get_sec_dilution_flags, get_bars_yfinance
+from halts import get_recently_resumed
 from indicators import compute_all
 from scoring import score_symbol
 from universe import get_universe
@@ -74,29 +76,67 @@ def test_email():
     return {"sent": True, "to": config.ALERT_EMAIL_TO, "note": "Провери логовете (Logs таб) и пощата си."}
 
 
-def _has_news_catalyst(symbol: str) -> bool:
+def _has_news_catalyst(symbol: str, resumed_symbols: set) -> bool:
+    if symbol in resumed_symbols:
+        # Наскоро възобновен след halt - почти винаги реален catalyst, дори
+        # когато безплатните ни новинарски източници още не са го хванали.
+        # Виж halts.py за защо не пращаме алърт директно на "спрян" статус.
+        return True
     news = alpaca.get_news(symbol, limit=5) or finnhub.company_news(symbol, days_back=2) or fmp.stock_news(symbol, limit=5)
     return bool(news)
 
 
+_NY_TZ = ZoneInfo("America/New_York")
+
+
 def _is_market_hours() -> bool:
-    now = datetime.now(timezone.utc)
-    if now.weekday() >= 5:
+    """Редовна сесия (9:30-16:00 ET) + pre-market (4:00-9:30 ET), по избор на
+    потребителя. Смятаме директно в America/New_York чрез zoneinfo, вместо
+    твърд UTC офсет - това автоматично оправя и DST нюанса от старата версия
+    (лятно/зимно часово време в САЩ вече не разминава прозореца).
+
+    ВНИМАНИЕ: Alpaca безплатният IEX feed покрива само ~2.5% от обема на
+    пазара (по документацията им) - през pre-market вероятно ще вижда МНОГО
+    по-рядки/тънки данни, отколкото през редовната сесия. Не е гарантирано,
+    че FMP-ските movers endpoint-и (biggest-gainers/losers/most-actives)
+    реално отразяват pre-market движение - тяхната документация не го
+    потвърждава изрично. С други думи: ботът ще ОПИТВА да сканира през
+    pre-market, но количеството/качеството на кандидатите може да е по-слабо
+    отколкото през 9:30-16:00 ET - провери логовете, за да видиш реално
+    какво се случва.
+    """
+    now_et = datetime.now(_NY_TZ)
+    if now_et.weekday() >= 5:
         return False
-    # NASDAQ/NYSE: 13:30-20:00 UTC (9:30-16:00 ET, без DST нюанси - достатъчно за MVP)
-    minutes = now.hour * 60 + now.minute
-    return 13 * 60 + 30 <= minutes <= 20 * 60
+    minutes = now_et.hour * 60 + now_et.minute
+    pre_market_start = config.PREMARKET_START_HOUR * 60 + config.PREMARKET_START_MINUTE
+    regular_close = 16 * 60
+    return pre_market_start <= minutes <= regular_close
+
+
+_MIN_BARS_FOR_INDICATORS = 25  # виж indicators.compute_all() - под това връща {}
 
 
 def _score_symbols(symbols) -> list:
     scores = []
+    # Веднъж на сканиране (не на тикер) - виж halts.py::get_recently_resumed.
+    resumed_symbols = set(get_recently_resumed().keys())
     for symbol in symbols:
         try:
             bars = alpaca.get_bars(symbol, timeframe="5Min", limit=100)
+            if len(bars) < _MIN_BARS_FOR_INDICATORS:
+                # Alpaca IEX е твърде тънък тук (чест случай в pre-market, или
+                # при силно неликвидни тикери дори през редовна сесия) -
+                # опитваме безплатния yfinance fallback (по-пълни, консолидирани
+                # данни, включително pre/post market), вместо просто да
+                # пропуснем кандидата.
+                fallback = get_bars_yfinance(symbol)
+                if len(fallback) > len(bars):
+                    bars = fallback
             ind = compute_all(bars)
             if not ind or ind["price"] > config.MAX_UNIVERSE_PRICE:
                 continue
-            catalyst = _has_news_catalyst(symbol)
+            catalyst = _has_news_catalyst(symbol, resumed_symbols)
             dilution = get_sec_dilution_flags(symbol)
             scores.append(score_symbol(symbol, ind, catalyst, dilution))
         except Exception as e:
@@ -106,12 +146,34 @@ def _score_symbols(symbols) -> list:
 
 def _maybe_alert_high_potential(symbol: str, meta: dict, result):
     """Праща алърт само при НОВО пресичане на прага - не спамва на всеки
-    бърз цикъл докато тикерът си стои над прага."""
+    бърз цикъл докато тикерът си стои над прага. Плюс защита срещу
+    "купуване на върха" (виж config.MIN_HIGH_POTENTIAL_CONFIRMATIONS /
+    PEAK_DRAWDOWN_STOP_PCT): изисква поне N последователни проверки над
+    прага (не еднократен spike) и цената да не е вече паднала осезаемо
+    от най-високата видяна цена, преди да пратим email."""
+    price = (result.raw or {}).get("price") if result else None
+    if price:
+        meta["peak_price"] = max(meta.get("peak_price") or price, price)
+
     if result and result.is_high_potential:
+        meta["consecutive_high_potential"] = meta.get("consecutive_high_potential", 0) + 1
+        peak_price = meta.get("peak_price")
+        drawdown_pct = ((peak_price - price) / peak_price * 100) if (peak_price and price) else 0.0
+        already_rolling_over = drawdown_pct >= config.PEAK_DRAWDOWN_STOP_PCT
+        confirmed = meta["consecutive_high_potential"] >= config.MIN_HIGH_POTENTIAL_CONFIRMATIONS
+
         if not meta.get("alerted_high_potential"):
-            send_alert(f"ВИСОК ПОТЕНЦИАЛ (~{round(config.TARGET_PROFIT_PCT*100)}%)", result)
-            meta["alerted_high_potential"] = True
+            if confirmed and not already_rolling_over:
+                send_alert(f"ВИСОК ПОТЕНЦИАЛ (~{round(config.TARGET_PROFIT_PCT*100)}%)", result)
+                meta["alerted_high_potential"] = True
+            elif already_rolling_over:
+                log.info(
+                    "%s: score е висок, НО цената вече е паднала %.1f%% от пика - "
+                    "най-вероятно върхът е изпуснат, пропускам алърта.",
+                    symbol, drawdown_pct,
+                )
     else:
+        meta["consecutive_high_potential"] = 0
         meta["alerted_high_potential"] = False
 
 
