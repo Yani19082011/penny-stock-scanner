@@ -138,7 +138,6 @@ def get_sec_dilution_flags(symbol: str) -> dict:
     Проверка в SEC EDGAR full-text search за скорошни S-1/S-3/424B filings
     (класически dilution риск за penny stocks). Безплатно, без API ключ.
     """
-    url = "https://efts.sec.gov/LATEST/search-index"
     try:
         r = requests.get(
             "https://efts.sec.gov/LATEST/search-index?q=%22{}%22&forms=S-1,S-3,424B5".format(symbol),

@@ -55,9 +55,20 @@ REQUIRED_CONFIG_ATTRS = [
     "SCAN_INTERVAL_MINUTES", "FAST_INTERVAL_MINUTES",
     "MIN_HIGH_POTENTIAL_CONFIRMATIONS", "PEAK_DRAWDOWN_STOP_PCT",
     "POSITION_SIZE_EUR", "TARGET_PROFIT_EUR", "TARGET_PROFIT_PCT",
+    "HIGH_POTENTIAL_THRESHOLD", "EXIT_THRESHOLD",
     "ALERT_EMAIL_ENABLED", "RESEND_API_KEY", "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO",
     "MIN_EMAIL_INTERVAL_SECONDS", "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT",
     "KEEP_ALIVE_PING_MINUTES",
+    # --- добавени 18.09 при цялостен преглед на кода - тези липсваха от
+    # проверката, въпреки че се четат реално от bota (главно от клиентите,
+    # инстанцирани по-долу, и от watchlist.py) - виж коментара при
+    # _startup_self_check() за защо реда на изпълнение по-долу вече слага
+    # тази проверка ПРЕДИ инстанцирането им. ---
+    "ALPACA_API_KEY", "ALPACA_SECRET_KEY", "ALPACA_BASE_URL", "ALPACA_DATA_URL",
+    "FINNHUB_API_KEY", "FMP_API_KEY", "DATA_DIR", "WATCHLIST_FILE",
+    "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN",
+    "ALERT_ACTIVE_START_HOUR", "ALERT_ACTIVE_START_MINUTE",
+    "ALERT_ACTIVE_END_HOUR", "ALERT_ACTIVE_END_MINUTE",
 ]
 
 
@@ -91,6 +102,15 @@ def _startup_self_check():
 
     log.info("Стартова самопроверка: config.py и scoring.py изглеждат съвместими.")
 
+
+# ВАЖНО (18.09, намерено при цялостен преглед на кода): _startup_self_check()
+# трябва да се извика ТУК, ПРЕДИ инстанцирането на клиентите по-долу - иначе
+# AlpacaClient()/FinnhubClient()/FMPClient() (ако четат config стойности при
+# конструиране) могат да гръмнат с гол, неясен AttributeError при стар/непълен
+# config.py, преди самата самопроверка изобщо да успее да покаже ясната
+# CRITICAL диагностика по-горе. main() по-долу вече НЕ вика проверката пак -
+# извикана е веднъж, тук, при импортиране на модула.
+_startup_self_check()
 
 alpaca = AlpacaClient()
 finnhub = FinnhubClient()
@@ -366,7 +386,9 @@ def _self_ping_loop():
 
 
 def main():
-    _startup_self_check()
+    # _startup_self_check() вече е извикана веднъж при импортиране на модула
+    # (виж по-горе, ПРЕДИ инстанцирането на alpaca/finnhub/fmp) - не се
+    # налага втори път тук.
     thread = threading.Thread(target=_scan_loop, daemon=True)
     thread.start()
     ping_thread = threading.Thread(target=_self_ping_loop, daemon=True)

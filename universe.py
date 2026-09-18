@@ -66,7 +66,7 @@ LARGE_CAP_BLOCKLIST = {
     "MARA", "RIOT", "NIO", "F", "AMC", "GME", "NOK", "SIRI", "SOFI",
     "PLUG", "FCEL", "BBBY", "BB", "WISH", "CLOV", "SNDL", "NNDM",
     "AAL", "UAL", "CCL", "T", "VZ", "INTC", "PLTR", "LCID", "NKLA",
-    "SNAP", "SNAP.US", "PINS", "UBER", "LYFT", "PYPL", "RIVN", "COIN",
+    "SNAP", "PINS", "UBER", "LYFT", "PYPL", "RIVN", "COIN",
     "HOOD", "DKNG", "CHPT", "OPEN", "AFRM", "MRVL",
 }
 

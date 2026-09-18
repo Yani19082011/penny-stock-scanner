@@ -26,6 +26,18 @@ ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 
+# --- Scoring прагове (виж scoring.py::ScoreResult) ---
+# ВАЖНО (18.09, намерено при цялостен преглед на кода): scoring.py досега
+# имаше СВОИ собствени hardcoded module-level константи (HIGH_POTENTIAL_
+# THRESHOLD=70, EXIT_THRESHOLD=40) и НИКОГА не четеше config.py - т.е.
+# промяна на HIGH_POTENTIAL_THRESHOLD през .env/Render Environment Variables
+# нямаше АБСОЛЮТНО НИКАКЪВ ефект върху реалното поведение на бота. Сега
+# scoring.py чете директно config.HIGH_POTENTIAL_THRESHOLD/config.EXIT_
+# THRESHOLD - стойностите по подразбиране по-долу пазят точно старото
+# поведение (70/40), просто вече реално се четат от тук.
+HIGH_POTENTIAL_THRESHOLD = float(os.getenv("HIGH_POTENTIAL_THRESHOLD", "70"))
+EXIT_THRESHOLD = float(os.getenv("EXIT_THRESHOLD", "40"))
+
 # --- Watchlist / universe ---
 MAX_UNIVERSE_PRICE = float(os.getenv("MAX_UNIVERSE_PRICE", "10"))
 # Горен праг на пазарна капитализация - за да са РЕАЛНИ penny stocks (малки,
@@ -78,7 +90,11 @@ PEAK_DRAWDOWN_STOP_PCT = float(os.getenv("PEAK_DRAWDOWN_STOP_PCT", "5"))
 # --- Позициониране (само за информативния текст в алъртите - не изпълнява поръчки) ---
 POSITION_SIZE_EUR = float(os.getenv("POSITION_SIZE_EUR", "20"))
 TARGET_PROFIT_EUR = float(os.getenv("TARGET_PROFIT_EUR", "5"))
-TARGET_PROFIT_PCT = TARGET_PROFIT_EUR / POSITION_SIZE_EUR  # 0.25 по подразбиране
+# Защита срещу ZeroDivisionError при POSITION_SIZE_EUR=0 (намерено при
+# цялостен преглед на кода, 18.09) - това е само информативен % за текста в
+# алъртите, не истинско изпълнение на поръчки, затова при 0 просто пада
+# обратно на 0% вместо да гръмне цялото стартиране на бота.
+TARGET_PROFIT_PCT = (TARGET_PROFIT_EUR / POSITION_SIZE_EUR) if POSITION_SIZE_EUR else 0.0  # 0.25 по подразбиране
 
 # --- Email алърти ---
 ALERT_EMAIL_ENABLED = _bool("ALERT_EMAIL_ENABLED", False)
@@ -122,6 +138,19 @@ PORT = int(os.getenv("PORT", "10000"))
 # пълния контекст (18.09). 5 минути = 3x резерва спрямо 15-те минути праг,
 # на който Render безплатният план приспива service-а без входящ трафик.
 KEEP_ALIVE_PING_MINUTES = int(os.getenv("KEEP_ALIVE_PING_MINUTES", "5"))
+
+# --- Трайна памет отвъд Render локалния диск (по избор) ---
+# Виж коментара в watchlist.py::load_watchlist за пълния контекст (18.09,
+# по оплакване за повторни email-и след всеки push/redeploy). Ако зададени -
+# watchlist-ът се пази в безплатен Upstash Redis (upstash.com) вместо на
+# локалния Render диск, който се изтрива при всеки redeploy. Взимат се от
+# Upstash dashboard -> базата -> таб "REST API". Ако останат празни - ботът
+# продължава по старому с локален файл (работи си, просто не оцелява
+# redeploy). Може да се ползва СЪЩАТА Upstash база и за MemecoinScanner -
+# ключовете са различни ("pennystockscanner:watchlist" vs
+# "memecoinscanner:seen"), не се бъркат.
+UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
+UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 # --- Файлове ---
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")

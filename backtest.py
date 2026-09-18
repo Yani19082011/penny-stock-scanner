@@ -13,8 +13,9 @@ import logging
 import pandas as pd
 import yfinance as yf
 
+import config
 from indicators import compute_all
-from scoring import score_symbol, HIGH_POTENTIAL_THRESHOLD
+from scoring import score_symbol
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger("backtest")
@@ -47,7 +48,7 @@ def backtest_symbol(symbol: str, days: int, forward_days: int = 5, min_bars: int
         # безплатния tier не покриват назад години. Смятай прага съответно
         # по-консервативно за живата версия.
         result = score_symbol(symbol, ind, has_news_catalyst=False, dilution_flags={})
-        if result.score >= HIGH_POTENTIAL_THRESHOLD - 15:  # по-нисък праг тук, защото няма catalyst точки
+        if result.score >= config.HIGH_POTENTIAL_THRESHOLD - 15:  # по-нисък праг тук, защото няма catalyst точки
             entry_price = df["close"].iloc[i]
             exit_price = df["close"].iloc[i + forward_days]
             ret_pct = (exit_price - entry_price) / entry_price * 100

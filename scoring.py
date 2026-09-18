@@ -8,6 +8,8 @@ target) идва от backtest.py - тук е само формулата и р�
 from dataclasses import dataclass, field
 from typing import Optional
 
+import config
+
 WEIGHTS = {
     "trend_up": 15,           # EMA9 > EMA20
     "above_vwap": 10,
@@ -19,10 +21,11 @@ WEIGHTS = {
     "no_dilution_filing": 5,  # без скорошен S-1/S-3/424B filing
 }
 
-# Праг, над който сигналът се маркира като "потенциал за target %" (виж config.TARGET_PROFIT_PCT)
-HIGH_POTENTIAL_THRESHOLD = 70
-# Праг, под който тикер отпада от watchlist-а (виж watchlist.py)
-EXIT_THRESHOLD = 40
+# ВАЖНО (18.09, намерено при цялостен преглед на кода): преди тук стояха
+# HIGH_POTENTIAL_THRESHOLD/EXIT_THRESHOLD като hardcoded module константи,
+# БЕЗ import config - т.е. промяна на HIGH_POTENTIAL_THRESHOLD през .env/
+# Render Environment Variables нямаше НИКАКЪВ ефект. Сега четем директно от
+# config.py (виж коментара там) - стойностите по подразбиране са същите.
 
 
 @dataclass
@@ -47,11 +50,11 @@ class ScoreResult:
         # dilution filing вече спира "ВИСОК ПОТЕНЦИАЛ" алърта твърдо,
         # независимо от score-а - тикерът остава в watchlist-а (виж
         # should_stay_in_watchlist), просто не се праща actionable email.
-        return self.score >= HIGH_POTENTIAL_THRESHOLD and self.has_catalyst and not self.has_dilution_risk
+        return self.score >= config.HIGH_POTENTIAL_THRESHOLD and self.has_catalyst and not self.has_dilution_risk
 
     @property
     def should_stay_in_watchlist(self) -> bool:
-        return self.score >= EXIT_THRESHOLD
+        return self.score >= config.EXIT_THRESHOLD
 
 
 def _relative_volume_points(rel_vol: Optional[float]) -> float:
