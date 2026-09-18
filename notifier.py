@@ -91,27 +91,40 @@ def format_alert(kind: str, result: ScoreResult) -> str:
     return "\n".join(l for l in lines if l)
 
 
-def send_alert(kind: str, result: ScoreResult):
+def can_send_now() -> bool:
+    """Pure "peek" - True ако email, пратен точно СЕГА, НЕ би бил пропуснат
+    заради anti-spam темпото (MIN_EMAIL_INTERVAL_SECONDS/MAX_EMAILS_PER_DAY).
+    main.py я ползва, за да НЕ маркира тикер като "вече алъртнат", когато
+    реално email-ът е бил пропуснат заради темпото - виж коментара в
+    main.py::_maybe_alert_high_potential (18.09)."""
+    return _rate_limit_ok()
+
+
+def send_alert(kind: str, result: ScoreResult) -> bool:
+    """Връща True ако е "обработено" (пратен успешно, ИЛИ email-ите са
+    изключени/не са конфигурирани, ИЛИ извън разрешените часове - retry не
+    би помогнал), False САМО ако е пропуснат чисто заради anti-spam темпото."""
     message = format_alert(kind, result)
     log.info("ALERT:\n%s", message)
 
-    if config.ALERT_EMAIL_ENABLED:
-        _send_email(subject=f"[Penny Stock Scanner] {result.symbol} - {kind}", body=message)
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    return _send_email(subject=f"[Penny Stock Scanner] {result.symbol} - {kind}", body=message)
 
 
-def _send_email(subject: str, body: str):
+def _send_email(subject: str, body: str) -> bool:
     if not (config.RESEND_API_KEY and config.ALERT_EMAIL_TO):
         log.warning("Email алъртите са включени, но RESEND_API_KEY или ALERT_EMAIL_TO не са попълнени.")
-        return
+        return True
     if not _within_active_hours():
         log.info(
             "Извън разрешените часове за имейли (%02d:%02d-%02d:%02d %s) - пропускам email-а (алъртът е в логовете).",
             config.ALERT_ACTIVE_START_HOUR, config.ALERT_ACTIVE_START_MINUTE,
             config.ALERT_ACTIVE_END_HOUR, config.ALERT_ACTIVE_END_MINUTE, config.ALERT_QUIET_HOURS_TZ,
         )
-        return
+        return True
     if not _rate_limit_ok():
-        return
+        return False
     try:
         resp = requests.post(
             RESEND_API_URL,
@@ -129,8 +142,10 @@ def _send_email(subject: str, body: str):
         )
         if resp.status_code >= 300:
             log.error("Resend отказа изпращането (%s): %s", resp.status_code, resp.text)
-        else:
-            _mark_email_sent()
-            log.info("Email алърт изпратен до %s през Resend", config.ALERT_EMAIL_TO)
+            return True  # HTTP грешка, не anti-spam темпо - не искаме безкраен retry цикъл
+        _mark_email_sent()
+        log.info("Email алърт изпратен до %s през Resend", config.ALERT_EMAIL_TO)
+        return True
     except Exception as e:
         log.error("Изпращането на email през Resend се провали: %s", e)
+        return True  # мрежова грешка, вече е логнато - не anti-spam темпо

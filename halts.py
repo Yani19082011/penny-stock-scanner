@@ -81,12 +81,25 @@ _BROWSER_HEADERS = {
 # без да разнасяме сигнала твърде дълго във времето.
 RESUME_SIGNAL_WINDOW_MINUTES = int(os.getenv("RESUME_SIGNAL_WINDOW_MINUTES", "90"))
 
+# Минимален интервал между РЕАЛНИ HTTP заявки към NYSE (18.09, намерено в
+# Render логове: "NYSE halts fail: 403 Client Error: Forbidden" на всеки
+# бърз цикъл - т.е. на всеки ~2 мин, config.FAST_INTERVAL_MINUTES). Тествах
+# самия endpoint отделно - работи нормално (200, чисти данни), значи 403-ката
+# най-вероятно е блокиране на Render-ския IP от анти-бот защита, не проблем
+# в схемата на заявката. Смяна на headers няма да оправи IP-базиран блок, но
+# по-рядко чукане поне намалява шанса да удряме rate-limit допълнително -
+# и е разумна хигиена дори да е чисто IP блок (не помага, но и не пречи).
+# RESUME_SIGNAL_WINDOW_MINUTES (90 мин) толерира тази по-рядка свежест без
+# проблем - сигналът пак важи достатъчно дълго.
+HALTS_MIN_REFRESH_SECONDS = int(os.getenv("HALTS_MIN_REFRESH_SECONDS", "300"))
+
 # Модулно състояние - персистира в паметта на процеса между поредните
 # извиквания (Render service-ът тече в един непрекъснат процес, не се
 # рестартира между сканиранията). Не се пази на диск - при рестарт на
 # service-а просто губим текущия "diff" контекст за няколко минути.
 _previous_halts: dict = {}
 _recently_resumed: dict = {}
+_last_fetch_at: float = 0.0
 
 
 def get_current_halts() -> dict | None:
@@ -147,11 +160,26 @@ def get_recently_resumed() -> dict:
 
     Извиква get_current_halts() САМО веднъж на повикване - вика я оттук
     директно вместо да разчита extern код да я е викнал вече, за да е
-    diff-ът винаги коректен спрямо реално последното известно състояние."""
-    global _previous_halts, _recently_resumed
+    diff-ът винаги коректен спрямо реално последното известно състояние.
+
+    ВНИМАНИЕ (18.09): не прави реална HTTP заявка по-често от веднъж на
+    HALTS_MIN_REFRESH_SECONDS, дори ако извикващият код (main.py) я вика по-
+    често (напр. на всеки бърз цикъл) - виж коментара при HALTS_MIN_REFRESH_SECONDS
+    по-горе. Между тези опреснявания просто връща последното познато
+    състояние (след прочистване на изтеклите записи)."""
+    global _previous_halts, _recently_resumed, _last_fetch_at
+
+    now = time.time()
+    if _last_fetch_at and (now - _last_fetch_at) < HALTS_MIN_REFRESH_SECONDS:
+        cutoff = now - RESUME_SIGNAL_WINDOW_MINUTES * 60
+        _recently_resumed = {
+            symbol: info for symbol, info in _recently_resumed.items()
+            if info.get("resumed_at", 0) >= cutoff
+        }
+        return dict(_recently_resumed)
 
     current = get_current_halts()
-    now = time.time()
+    _last_fetch_at = now
 
     if current is None:
         # Заявката към NYSE се провали тази обиколка - НЕ пипаме

@@ -212,8 +212,24 @@ def _maybe_alert_high_potential(symbol: str, meta: dict, result):
 
         if not meta.get("alerted_high_potential"):
             if confirmed and not already_rolling_over:
-                send_alert(f"ВИСОК ПОТЕНЦИАЛ (~{round(config.TARGET_PROFIT_PCT*100)}%)", result)
-                meta["alerted_high_potential"] = True
+                # ВАЖНО (18.09, по изричен избор на потребителя): send_alert()
+                # връща False САМО ако anti-spam темпото (MIN_EMAIL_INTERVAL_
+                # SECONDS/MAX_EMAILS_PER_DAY) е блокирало email-а точно сега -
+                # преди тук флагът се вдигаше БЕЗУСЛОВНО, дори когато email-ът
+                # реално е бил пропуснат заради темпото, което ГУБЕШЕ тикера
+                # завинаги (следващият цикъл вижда alerted_high_potential=True
+                # и никога не пробва пак). Сега флагът се вдига само при
+                # реално "обработен" резултат - при пропуск заради темпото,
+                # следващият бърз/пълен цикъл (2/10 мин по-късно) пробва пак с
+                # ПРЕСНИ данни (нов score/цена от новото сканиране).
+                if send_alert(f"ВИСОК ПОТЕНЦИАЛ (~{round(config.TARGET_PROFIT_PCT*100)}%)", result):
+                    meta["alerted_high_potential"] = True
+                else:
+                    log.info(
+                        "%s: score е потвърден, НО anti-spam темпото не позволява email точно сега - "
+                        "ще пробвам пак на следващия цикъл.",
+                        symbol,
+                    )
             elif already_rolling_over:
                 log.info(
                     "%s: score е висок, НО цената вече е паднала %.1f%% от пика - "

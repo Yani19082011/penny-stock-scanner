@@ -31,11 +31,23 @@ class ScoreResult:
     score: float
     reasons: list = field(default_factory=list)
     has_catalyst: bool = False
+    has_dilution_risk: bool = False
     raw: dict = field(default_factory=dict)
 
     @property
     def is_high_potential(self) -> bool:
-        return self.score >= HIGH_POTENTIAL_THRESHOLD and self.has_catalyst
+        # ВАЖНО (18.09, намерено в реален Render лог): активен S-1/S-3/424B
+        # dilution filing преди коства само WEIGHTS["no_dilution_filing"] (5
+        # точки от 100) - лесно компенсирано от силни технически показатели.
+        # Реален случай: TEAD score=75 (над прага 70) SЪС активен dilution
+        # filing флаг - пратихме "ВИСОК ПОТЕНЦИАЛ" алърт за компания, която
+        # буквално обявява, че се готви да размие акционерите - класически
+        # ценови убиец, независимо колко добър изглежда графиката точно сега.
+        # Същия принцип като danger-флаговете в MemecoinScanner: активен
+        # dilution filing вече спира "ВИСОК ПОТЕНЦИАЛ" алърта твърдо,
+        # независимо от score-а - тикерът остава в watchlist-а (виж
+        # should_stay_in_watchlist), просто не се праща actionable email.
+        return self.score >= HIGH_POTENTIAL_THRESHOLD and self.has_catalyst and not self.has_dilution_risk
 
     @property
     def should_stay_in_watchlist(self) -> bool:
@@ -90,15 +102,17 @@ def score_symbol(symbol: str, ind: dict, has_news_catalyst: bool, dilution_flags
     if rsi14 is not None and rsi14 < 75:
         points += WEIGHTS["rsi_not_overbought"]
 
-    if not dilution_flags.get("has_recent_dilution_filing", False):
+    has_dilution_risk = bool(dilution_flags.get("has_recent_dilution_filing", False))
+    if not has_dilution_risk:
         points += WEIGHTS["no_dilution_filing"]
     else:
-        reasons.append("⚠️ скорошен dilution filing (S-1/S-3/424B) - risk flag")
+        reasons.append("⚠️ скорошен dilution filing (S-1/S-3/424B) - твърдо спира 'ВИСОК ПОТЕНЦИАЛ' алърта (виж is_high_potential)")
 
     return ScoreResult(
         symbol=symbol,
         score=round(points, 1),
         reasons=reasons,
         has_catalyst=has_news_catalyst,
+        has_dilution_risk=has_dilution_risk,
         raw=ind,
     )
