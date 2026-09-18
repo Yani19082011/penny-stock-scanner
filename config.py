@@ -117,6 +117,12 @@ ALERT_ACTIVE_END_MINUTE = int(os.getenv("ALERT_ACTIVE_END_MINUTE", "0"))
 # --- Render (или локален) HTTP порт за health-check ---
 PORT = int(os.getenv("PORT", "10000"))
 
+# --- Self-ping (keep-alive) ---
+# Виж коментара в main.py::_self_ping_loop / MemecoinScanner/config.py за
+# пълния контекст (18.09). 5 минути = 3x резерва спрямо 15-те минути праг,
+# на който Render безплатният план приспива service-а без входящ трафик.
+KEEP_ALIVE_PING_MINUTES = int(os.getenv("KEEP_ALIVE_PING_MINUTES", "5"))
+
 # --- Файлове ---
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")

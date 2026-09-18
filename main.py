@@ -18,11 +18,13 @@ pinger (cron-job.org / UptimeRobot) към "/" на всеки 10 мин - ви�
 На Render: Start Command = python main.py (виж README.md за детайли).
 """
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import requests
 import schedule
 from flask import Flask
 
@@ -55,6 +57,7 @@ REQUIRED_CONFIG_ATTRS = [
     "POSITION_SIZE_EUR", "TARGET_PROFIT_EUR", "TARGET_PROFIT_PCT",
     "ALERT_EMAIL_ENABLED", "RESEND_API_KEY", "RESEND_FROM_EMAIL", "ALERT_EMAIL_TO",
     "MIN_EMAIL_INTERVAL_SECONDS", "MAX_EMAILS_PER_DAY", "ALERT_QUIET_HOURS_TZ", "PORT",
+    "KEEP_ALIVE_PING_MINUTES",
 ]
 
 
@@ -337,10 +340,37 @@ def _scan_loop():
         time.sleep(15)
 
 
+def _self_ping_loop():
+    """Праща GET заявка към собствения публичен Render URL на всеки
+    config.KEEP_ALIVE_PING_MINUTES минути - виж идентичния коментар в
+    MemecoinScanner/main.py::_self_ping_loop за пълния контекст (18.09,
+    по оплакване "от час и нещо няма никакви сигнали"). Тук ефектът е малко
+    по-различен - извън пазарни часове ботът и без друго не сканира - но
+    докато е пазарно време, service-ът заспал = пропуснат fast/full цикъл,
+    затова пак си струва да не разчитаме само на външен pinger."""
+    external_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not external_url:
+        log.info("RENDER_EXTERNAL_URL не е зададен (вероятно локално стартиране) - self-ping е изключен.")
+        return
+    log.info(
+        "Self-ping активен: %s на всеки %d мин (пази Render service-а буден).",
+        external_url, config.KEEP_ALIVE_PING_MINUTES,
+    )
+    while True:
+        time.sleep(config.KEEP_ALIVE_PING_MINUTES * 60)
+        try:
+            requests.get(external_url, timeout=10)
+            log.info("Self-ping към %s - ОК.", external_url)
+        except Exception as e:
+            log.warning("Self-ping към %s се провали: %s (ще пробвам пак след %d мин).", external_url, e, config.KEEP_ALIVE_PING_MINUTES)
+
+
 def main():
     _startup_self_check()
     thread = threading.Thread(target=_scan_loop, daemon=True)
     thread.start()
+    ping_thread = threading.Thread(target=_self_ping_loop, daemon=True)
+    ping_thread.start()
     app.run(host="0.0.0.0", port=config.PORT)
 
 
