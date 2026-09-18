@@ -1,168 +1,153 @@
 """
-Wrapper-и над публичните безплатни API-та за on-chain/риск данни.
-
-ВАЖНО за поддръжка: точните имена на JSON полетата на RugCheck и
-формата на PumpPortal migration съобщенията не са напълно документирани
-публично и могат да се различават леко от това, което е тук - кодът е
-писан defensively (winner .get() навсякъде, никога няма да гръмне при
-липсващо поле), но провери логовете след първия деплой (`log.info` реда
-с "RAW migration payload" / "RAW rugcheck report") и коригирай ключовете
-тук, ако DexScreener/RugCheck са сменили схемата си междувременно.
+Wrapper-и около външните API-та. Всеки метод връща pandas DataFrame или
+обикновен Python обект - за да могат indicators.py / scoring.py да работят
+без да знаят откъде идват данните.
 """
-import logging
 import time
+import logging
+from datetime import datetime, timedelta, timezone
 
 import requests
+import pandas as pd
+
+import config
 
 log = logging.getLogger("data_sources")
 
-# Retry при 429 от DexScreener - живи Render логове (17.09) показаха, че
-# ДОРИ след batch-ването (1 заявка за 8 адреса вместо 8 отделни) пак
-# получаваме 429 - значи лимитът е по-строг от очакваното, или Render
-# безплатният tier споделя изходящ IP с други потребители, които вече го
-# наближават (извън наш контрол). Кратко изчакване + retry често е
-# достатъчно, защото повечето подобни лимити са rolling-window (изчистват
-# се след няколко секунди), не твърд таван за деня.
-DEXSCREENER_MAX_RETRIES = 3
-DEXSCREENER_RETRY_BASE_DELAY_SECONDS = 3
 
+class AlpacaClient:
+    """Тънка обвивка над Alpaca Market Data API v2 (безплатен IEX feed)."""
 
-def _sort_pairs_by_liquidity(pairs: list[dict]) -> list[dict]:
-    pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd", 0), reverse=True)
-    return pairs
+    def __init__(self):
+        self.headers = {
+            "APCA-API-KEY-ID": config.ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": config.ALPACA_SECRET_KEY,
+        }
 
-
-def get_dexscreener_pairs(mint_address: str) -> list[dict]:
-    """Връща списък от DEX двойки за токена (Raydium/PumpSwap/...), най-ликвидната първа.
-    Виж get_dexscreener_pairs_batch() за batch версията, ползвана от main.py при
-    следене на много монети едновременно (за да не удряме DexScreener rate limit-а)."""
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint_address}"
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        pairs = r.json().get("pairs") or []
-    except Exception as e:
-        log.warning("DexScreener fail за %s: %s", mint_address, e)
-        return []
-    return _sort_pairs_by_liquidity(pairs)
-
-
-# DexScreener позволява няколко token адреса в ЕДНА заявка, разделени със
-# запетая (потвърдено чрез живо тестване 17.09 - връща pairs и за двата
-# адреса в тестов пример) - точен максимален брой на заявка НЕ е официално
-# документиран, 30 е консервативна, разумна стойност (често срещана норма
-# при подобни batch API-та).
-DEXSCREENER_BATCH_SIZE = 30
-
-
-def _fetch_dexscreener_chunk(chunk: list[str]):
-    """Едно HTTP повикване за един chunk от адреси, с retry+backoff при 429.
-    Връща списъка от pairs (може да е []), или None ако всички опити
-    паднаха (извикващият код тогава просто пропуска този chunk тази
-    обиколка - следващата обиколка ще опита пак)."""
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
-    delay = DEXSCREENER_RETRY_BASE_DELAY_SECONDS
-
-    for attempt in range(1, DEXSCREENER_MAX_RETRIES + 1):
+    def get_bars(self, symbol: str, timeframe: str = "5Min", limit: int = 200) -> pd.DataFrame:
+        """Последните `limit` свещи за symbol. timeframe напр. '1Min','5Min','1Day'."""
+        url = f"{config.ALPACA_DATA_URL}/v2/stocks/{symbol}/bars"
+        params = {"timeframe": timeframe, "limit": limit, "feed": "iex"}
         try:
-            r = requests.get(url, timeout=15)
-            if r.status_code == 429:
-                if attempt < DEXSCREENER_MAX_RETRIES:
-                    log.warning(
-                        "DexScreener 429 за %d адреса (опит %d/%d) - изчаквам %dс и пробвам пак...",
-                        len(chunk), attempt, DEXSCREENER_MAX_RETRIES, delay,
-                    )
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-                log.warning(
-                    "DexScreener 429 за %d адреса - изчерпани %d опита, пропускам този chunk тази обиколка.",
-                    len(chunk), DEXSCREENER_MAX_RETRIES,
-                )
-                return None
+            r = requests.get(url, headers=self.headers, params=params, timeout=10)
             r.raise_for_status()
-            return r.json().get("pairs") or []
+            bars = r.json().get("bars", [])
         except Exception as e:
-            log.warning("DexScreener batch fail за %d адреса: %s", len(chunk), e)
+            log.warning(f"Alpaca bars fail за {symbol}: {e}")
+            return pd.DataFrame()
+        if not bars:
+            return pd.DataFrame()
+        df = pd.DataFrame(bars)
+        df.rename(columns={"t": "time", "o": "open", "h": "high", "l": "low",
+                            "c": "close", "v": "volume"}, inplace=True)
+        df["time"] = pd.to_datetime(df["time"])
+        return df.set_index("time")
+
+    def get_news(self, symbol: str, limit: int = 10):
+        """Alpaca News API (Benzinga-powered), безплатен с paper акаунт."""
+        url = "https://data.alpaca.markets/v1beta1/news"
+        params = {"symbols": symbol, "limit": limit}
+        try:
+            r = requests.get(url, headers=self.headers, params=params, timeout=10)
+            r.raise_for_status()
+            return r.json().get("news", [])
+        except Exception as e:
+            log.warning(f"Alpaca news fail за {symbol}: {e}")
+            return []
+
+
+class FinnhubClient:
+    BASE = "https://finnhub.io/api/v1"
+
+    def __init__(self):
+        self.key = config.FINNHUB_API_KEY
+
+    def _get(self, path, **params):
+        if not self.key:
             return None
-    return None
+        params["token"] = self.key
+        try:
+            r = requests.get(f"{self.BASE}{path}", params=params, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.warning(f"Finnhub {path} fail: {e}")
+            return None
+
+    def company_news(self, symbol: str, days_back: int = 3):
+        today = datetime.now(timezone.utc).date()
+        frm = today - timedelta(days=days_back)
+        return self._get("/company-news", symbol=symbol, **{"from": str(frm), "to": str(today)}) or []
+
+    def basic_financials(self, symbol: str):
+        data = self._get("/stock/metric", symbol=symbol, metric="all")
+        return (data or {}).get("metric", {})
+
+    def insider_transactions(self, symbol: str):
+        data = self._get("/stock/insider-transactions", symbol=symbol)
+        return (data or {}).get("data", [])
 
 
-def get_dexscreener_pairs_batch(mint_addresses: list[str]) -> dict[str, list[dict]]:
-    """Batch версия на get_dexscreener_pairs() - ЕДНА HTTP заявка за до
-    DEXSCREENER_BATCH_SIZE адреса наведнъж, вместо по една заявка на монета.
-
-    Защо е нужно: при следене на 20+ монети едновременно, ако всяка сама
-    си пита DexScreener на всеки poll (виж main.py::monitor_token), общият
-    брой заявки/минута лесно удря DexScreener-ския rate limit -> 429 Too
-    Many Requests -> изгубени/забавени ценови данни точно когато монетата
-    реално мърда (потвърдено в живите Render логове 17.09). Batch заявките
-    намаляват броя HTTP повиквания ~30x за същото покритие.
-
-    Връща {mint: sorted_pairs_list} за всеки заявен адрес (празен списък
-    ако адресът не е намерен/грешка в конкретния chunk - не гърми целия
-    batch заради един лош chunk)."""
-    result: dict[str, list[dict]] = {addr: [] for addr in mint_addresses}
-    if not mint_addresses:
-        return result
-
-    for i in range(0, len(mint_addresses), DEXSCREENER_BATCH_SIZE):
-        chunk = mint_addresses[i:i + DEXSCREENER_BATCH_SIZE]
-        pairs = _fetch_dexscreener_chunk(chunk)
-        if pairs is None:
-            continue  # изчерпани retry опити за този chunk - пропускаме тази обиколка
-
-        chunk_set = set(chunk)
-        for pair in pairs:
-            base_addr = (pair.get("baseToken") or {}).get("address")
-            quote_addr = (pair.get("quoteToken") or {}).get("address")
-            matched = base_addr if base_addr in chunk_set else (quote_addr if quote_addr in chunk_set else None)
-            if matched:
-                result[matched].append(pair)
-
-    for addr, pairs in result.items():
-        if pairs:
-            result[addr] = _sort_pairs_by_liquidity(pairs)
-    return result
-
-
-def get_rugcheck_report(mint_address: str) -> dict:
-    """RugCheck риск доклад. Публичен endpoint, без ключ за базов report (виж бележката горе).
-
-    ВАЖНО (18.09, намерено при преглед на живи Render логове - потребителят
-    докладва "bad request и други глупости" запушващи лога): RugCheck връща
-    HTTP 400 (не 404) за монета, която е реална, но още не е индексирана от
-    техния анализатор - буквално за ВСЯКА прясно graduated монета в първите
-    секунди/минути. Преди тук третирахме само 404 тихо, а 400 падаше в
-    except клона и печаташе WARNING на ВСЕКИ poll за почти всяка следена
-    монета - чист шум в логовете, без реален функционален проблем (score_token
-    вече обработва празен report грациозно - вижда се от "reasons"-а в
-    имейла). Сега и 400, и 404 се третират еднакво тихо ("още няма доклад") -
-    периодичното опресняване (config.RUGCHECK_REFRESH_EVERY_N_POLLS) пак ще
-    хване доклада веднага щом RugCheck реално го индексира."""
-    url = f"https://api.rugcheck.xyz/v1/tokens/{mint_address}/report"
+def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", limit: int = 100) -> pd.DataFrame:
+    """Fallback източник, когато Alpaca IEX връща твърде малко свещи -
+    типично през pre-market (IEX сам по себе си покрива само ~2.5% от обема
+    на пазара по документацията на Alpaca), но и през редовна сесия при
+    силно неликвидни penny stocks. yfinance е напълно БЕЗПЛАТЕН, без API
+    ключ, и обхваща консолидирани данни от повече борси (не само IEX),
+    включително pre/post market с prepost=True. Забавянето спрямо реално
+    време е типично няколко минути - не е "истински" real-time като платен
+    feed, но е много по-пълен от самостоятелния безплатен IEX feed."""
     try:
-        r = requests.get(url, timeout=10, headers={"Accept": "application/json"})
-        if r.status_code in (400, 404):
-            return {}
-        r.raise_for_status()
-        report = r.json()
-        log.debug("RAW rugcheck report за %s: %s", mint_address, report)
-        return report
+        import yfinance as yf
+        df = yf.Ticker(symbol).history(period=period, interval=interval, prepost=True)
+        if df.empty:
+            return pd.DataFrame()
+        df = df.rename(columns={
+            "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
+        })
+        return df[["open", "high", "low", "close", "volume"]].tail(limit)
     except Exception as e:
-        log.warning("RugCheck fail за %s: %s", mint_address, e)
-        return {}
+        log.warning("yfinance bars fail за %s: %s", symbol, e)
+        return pd.DataFrame()
 
 
-def extract_mint_address(migration_event: dict) -> str | None:
+class FMPClient:
+    BASE = "https://financialmodelingprep.com/stable"
+
+    def __init__(self):
+        self.key = config.FMP_API_KEY
+
+    def stock_news(self, symbol: str, limit: int = 10):
+        if not self.key:
+            return []
+        try:
+            r = requests.get(
+                f"{self.BASE}/news/stock",
+                params={"symbols": symbol, "limit": limit, "apikey": self.key},
+                timeout=10,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.warning(f"FMP news fail за {symbol}: {e}")
+            return []
+
+
+def get_sec_dilution_flags(symbol: str) -> dict:
     """
-    PumpPortal не публикува верижна схема за migration съобщението - пробваме
-    най-вероятните имена на ключа с адреса на токена. Ако нищо не съвпадне,
-    логваме целия payload за ръчна проверка (виж README.md).
+    Проверка в SEC EDGAR full-text search за скорошни S-1/S-3/424B filings
+    (класически dilution риск за penny stocks). Безплатно, без API ключ.
     """
-    for key in ("mint", "ca", "token", "mint_address", "tokenAddress", "address"):
-        val = migration_event.get(key)
-        if isinstance(val, str) and len(val) >= 32:
-            return val
-    log.warning("Не разпознах mint адрес в migration event, пълен payload: %s", migration_event)
-    return None
+    try:
+        r = requests.get(
+            "https://efts.sec.gov/LATEST/search-index?q=%22{}%22&forms=S-1,S-3,424B5".format(symbol),
+            timeout=10,
+            headers={"User-Agent": "penny-stock-scanner contact@example.com"},
+        )
+        if r.status_code != 200:
+            return {"has_recent_dilution_filing": False}
+        hits = r.json().get("hits", {}).get("total", {}).get("value", 0)
+        return {"has_recent_dilution_filing": hits > 0}
+    except Exception as e:
+        log.warning(f"SEC EDGAR fail за {symbol}: {e}")
+        return {"has_recent_dilution_filing": False}
