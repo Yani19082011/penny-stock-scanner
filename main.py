@@ -237,8 +237,21 @@ def _maybe_alert_high_potential(symbol: str, meta: dict, result):
                     symbol, drawdown_pct,
                 )
     else:
+        # ВАЖНО (18.09, по оплакване на потребителя "да не ми дава едни и
+        # същите"): преди тук се ресетваше и alerted_high_potential=False -
+        # т.е. ВСЯКО моментно падане на score под 70 (дори с 1 точка, дори
+        # временно defailure на news API-то, докато тикерът си стои спокойно
+        # В watchlist-а между EXIT_THRESHOLD=40 и HIGH_POTENTIAL_THRESHOLD=70)
+        # "забравяше", че вече сме алъртнали този тикер - и следващия път,
+        # щом score-ът пак минеше 70, се пращаше ВТОРИ email за СЪЩИЯ тикер,
+        # без той изобщо да е излизал от watchlist-а. Сега alerted_high_
+        # potential се пази, докато тикерът РЕАЛНО не отпадне от watchlist-а
+        # (score < EXIT_THRESHOLD - виж watchlist.py::update_watchlist, което
+        # тогава изтрива целия meta речник) - само тогава ново влизане получава
+        # чист старт и може да алъртне пак. consecutive_high_potential пак се
+        # ресетва нормално - анти-spike защитата (N последователни проверки)
+        # си остава непокътната за всеки нов опит.
         meta["consecutive_high_potential"] = 0
-        meta["alerted_high_potential"] = False
 
 
 def run_fast_check():
