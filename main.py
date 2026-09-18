@@ -263,7 +263,21 @@ def run_full_scan():
 
     scores_by_symbol = {s.symbol: s for s in all_scores}
     for symbol in added:
-        send_alert("НОВ в watchlist", scores_by_symbol[symbol])
+        # ВАЖНО (18.09, намерено при цялостен преглед на кода): по-рано тук
+        # директно се пращаше email при ВСЯКО влизане в watchlist - но
+        # влизането изисква само score >= EXIT_THRESHOLD (40/100) на ЕДНО-
+        # ЕДИНСТВЕНО сканиране, без потвърждение и без drawdown проверка -
+        # точно същият клас бъг ("алърт на единичен spike"), който вече
+        # оправихме за "ВИСОК ПОТЕНЦИАЛ" алъртите (виж
+        # MIN_HIGH_POTENTIAL_CONFIRMATIONS/PEAK_DRAWDOWN_STOP_PCT по-долу).
+        # Влизането в watchlist само по себе си вече НЕ праща email - само
+        # лог за проследяване. Реален email идва единствено през
+        # _maybe_alert_high_potential(), което изисква истинско потвърждение.
+        log.info(
+            "%s влиза в watchlist (score=%.1f) - следя го, но НЯМА да пратя email, докато не се "
+            "потвърди (виж MIN_HIGH_POTENTIAL_CONFIRMATIONS/PEAK_DRAWDOWN_STOP_PCT).",
+            symbol, scores_by_symbol[symbol].score,
+        )
     for symbol in dropped:
         log.info("%s излиза от watchlist (score падна под прага).", symbol)
 

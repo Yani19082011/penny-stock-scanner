@@ -97,9 +97,10 @@ ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "yani.kolev2011@gmail.com")
 # Алъртът винаги се вижда в Render Logs - само самото email изпращане се
 # прескача, ако сме над темпото.
 MIN_EMAIL_INTERVAL_SECONDS = int(os.getenv("MIN_EMAIL_INTERVAL_SECONDS", "420"))
-# По-малка част от общата дневна квота от 100 (споделена с memecoin бота) -
-# там пращаме 90/ден, тук само 10/ден (watchlist-ът е малък, не му трябва повече).
-MAX_EMAILS_PER_DAY = int(os.getenv("MAX_EMAILS_PER_DAY", "10"))
+# Дневната квота (100 общо за акаунта) е разпределена 70/30 между двата бота
+# по избор на потребителя (18.09: "70 memecoins 30 pennystocks") - memecoin
+# ботът държи 70, тук 30 (вдигнато от 10).
+MAX_EMAILS_PER_DAY = int(os.getenv("MAX_EMAILS_PER_DAY", "30"))
 
 # --- "Тихи часове" за имейл алъртите - потребителят иска имейли САМО между
 # 07:30 и 23:00 местно време (не иска да го буди бот през нощта). Прилага се

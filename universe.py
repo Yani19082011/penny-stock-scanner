@@ -55,11 +55,19 @@ _finnhub = FinnhubClient()
 
 # Познати средни/големи компании, които понякога излизат евтино/волатилно в
 # movers списъците, но НЕ са "penny stocks" по дух - изключваме твърдо,
-# независимо от цена/движение (директно заради оплакването за MARA/NIO).
+# независимо от цена/движение (директно заради оплакването за MARA/NIO, и
+# на 18.09 - SNAP: "даваш ми snapchat за пореден път... искам истински, не
+# такива големи известни"). Твърдият blocklist е нарочно НЕЗАВИСИМ от
+# market cap API-тата по-долу (StockAnalysis/Finnhub) - те понякога нямат
+# данни за конкретен тикер в конкретен момент (виж коментара при
+# _passes_market_cap_filter), а известно голямо име не бива да минава само
+# защото API-то временно мълчи за него.
 LARGE_CAP_BLOCKLIST = {
     "MARA", "RIOT", "NIO", "F", "AMC", "GME", "NOK", "SIRI", "SOFI",
     "PLUG", "FCEL", "BBBY", "BB", "WISH", "CLOV", "SNDL", "NNDM",
     "AAL", "UAL", "CCL", "T", "VZ", "INTC", "PLTR", "LCID", "NKLA",
+    "SNAP", "SNAP.US", "PINS", "UBER", "LYFT", "PYPL", "RIVN", "COIN",
+    "HOOD", "DKNG", "CHPT", "OPEN", "AFRM", "MRVL",
 }
 
 FALLBACK_UNIVERSE = [
