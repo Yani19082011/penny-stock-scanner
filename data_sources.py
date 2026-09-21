@@ -99,7 +99,8 @@ def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", lim
     feed, но е много по-пълен от самостоятелния безплатен IEX feed."""
     try:
         import yfinance as yf
-        df = yf.Ticker(symbol).history(period=period, interval=interval, prepost=True)
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=interval, prepost=True)
         if df.empty:
             return pd.DataFrame()
         df = df.rename(columns={
@@ -109,28 +110,6 @@ def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", lim
     except Exception as e:
         log.warning("yfinance bars fail за %s: %s", symbol, e)
         return pd.DataFrame()
-
-
-class FMPClient:
-    BASE = "https://financialmodelingprep.com/stable"
-
-    def __init__(self):
-        self.key = config.FMP_API_KEY
-
-    def stock_news(self, symbol: str, limit: int = 10):
-        if not self.key:
-            return []
-        try:
-            r = requests.get(
-                f"{self.BASE}/news/stock",
-                params={"symbols": symbol, "limit": limit, "apikey": self.key},
-                timeout=10,
-            )
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            log.warning(f"FMP news fail за {symbol}: {e}")
-            return []
 
 
 def get_sec_dilution_flags(symbol: str) -> dict:

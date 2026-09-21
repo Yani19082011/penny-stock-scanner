@@ -11,7 +11,7 @@ NYSE текущи търговски спирания (trading halts) - безп
 обичайния начин (цена, индикатори и т.н.), но ги третира и като
 "catalyst" сами по себе си (виж main.py::_has_news_catalyst) - защото
 halt за новини почти винаги означава реален catalyst, дори когато
-безплатните ни новинарски източници (Alpaca/Finnhub/FMP) още не са го
+безплатните ни новинарски източници (Alpaca/Finnhub) още не са го
 хванали.
 
 ВАЖНО: "текущо спрян" тикер НЕ Е директно търгуем (не можеш да го купиш,
@@ -54,7 +54,7 @@ Endpoint + JSON схема потвърдени чрез живо тестван
   }
 Забележка: "formated" (с една буква "t") е точно както идва от NYSE, не
 печатна грешка тук. Историческият download endpoint НЕ е потвърден да
-работи (връща 13 байта при тест) - затова тук ползваме само "current".
+работи (връща 13 байта при тест) - затова тук ползмаве само "current".
 Ако NYSE промени схемата, кодът е писан defensively - виж лога
 "RAW NYSE halt payload" в Render Logs за диагностика.
 """
@@ -71,32 +71,16 @@ NYSE_CURRENT_HALTS_URL = "https://www.nyse.com/api/trade-halts/current"
 _BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nyse.com/trade-halts/current",
 }
 
-# Колко дълго след като даден тикер изчезне от "current halts" списъка да
-# продължаваме да го смятаме за "наскоро възобновен" (catalyst сигнал).
-# 90 мин по подразбиране - достатъчно, за да хванем реакцията след resume,
-# без да разнасяме сигнала твърде дълго във времето.
 RESUME_SIGNAL_WINDOW_MINUTES = int(os.getenv("RESUME_SIGNAL_WINDOW_MINUTES", "90"))
-
-# Минимален интервал между РЕАЛНИ HTTP заявки към NYSE (18.09, намерено в
-# Render логове: "NYSE halts fail: 403 Client Error: Forbidden" на всеки
-# бърз цикъл - т.е. на всеки ~2 мин, config.FAST_INTERVAL_MINUTES). Тествах
-# самия endpoint отделно - работи нормално (200, чисти данни), значи 403-ката
-# най-вероятно е блокиране на Render-ския IP от анти-бот защита, не проблем
-# в схемата на заявката. Смяна на headers няма да оправи IP-базиран блок, но
-# по-рядко чукане поне намалява шанса да удряме rate-limit допълнително -
-# и е разумна хигиена дори да е чисто IP блок (не помага, но и не пречи).
-# RESUME_SIGNAL_WINDOW_MINUTES (90 мин) толерира тази по-рядка свежест без
-# проблем - сигналът пак важи достатъчно дълго.
 HALTS_MIN_REFRESH_SECONDS = int(os.getenv("HALTS_MIN_REFRESH_SECONDS", "300"))
 
-# Модулно състояние - персистира в паметта на процеса между поредните
-# извиквания (Render service-ът тече в един непрекъснат процес, не се
-# рестартира между сканиранията). Не се пази на диск - при рестарт на
-# service-а просто губим текущия "diff" контекст за няколко минути.
 _previous_halts: dict = {}
 _recently_resumed: dict = {}
 _last_fetch_at: float = 0.0
@@ -119,8 +103,6 @@ def get_current_halts() -> dict | None:
         log.warning("NYSE halts fail: %s", e)
         return None
 
-    # defensively - пробваме познатата схема, после разумни fallback-и, ако
-    # NYSE променят формата междувременно.
     rows = (
         (data.get("results") or {}).get("tradeHalts")
         or data.get("tradeHalts")
@@ -151,22 +133,6 @@ def get_current_halts() -> dict | None:
 
 
 def get_recently_resumed() -> dict:
-    """{symbol: {...последно известна halt инфо..., "resumed_at": epoch}} за
-    тикери, които са ИЗЧЕЗНАЛИ от текущия halts списък спрямо предишното
-    повикване - т.е. най-вероятно току-що са ВЪЗОБНОВЕНИ. Това е сигналът,
-    който реално има значение за сканиране (виж бележката горе - "текущо
-    спрян" не е търгуем). Резултатът остава в наличност
-    RESUME_SIGNAL_WINDOW_MINUTES минути след detection, после отпада сам.
-
-    Извиква get_current_halts() САМО веднъж на повикване - вика я оттук
-    директно вместо да разчита extern код да я е викнал вече, за да е
-    diff-ът винаги коректен спрямо реално последното известно състояние.
-
-    ВНИМАНИЕ (18.09): не прави реална HTTP заявка по-често от веднъж на
-    HALTS_MIN_REFRESH_SECONDS, дори ако извикващият код (main.py) я вика по-
-    често (напр. на всеки бърз цикъл) - виж коментара при HALTS_MIN_REFRESH_SECONDS
-    по-горе. Между тези опреснявания просто връща последното познато
-    състояние (след прочистване на изтеклите записи)."""
     global _previous_halts, _recently_resumed, _last_fetch_at
 
     now = time.time()
@@ -182,11 +148,6 @@ def get_recently_resumed() -> dict:
     _last_fetch_at = now
 
     if current is None:
-        # Заявката към NYSE се провали тази обиколка - НЕ пипаме
-        # _previous_halts и НЕ смятаме diff (виж коментара в
-        # get_current_halts() за защо: иначе всеки преди спрян тикер би
-        # изглеждал "току-що възобновен" само заради мрежова грешка).
-        # Просто изчистваме изтеклите записи и връщаме каквото вече знаем.
         log.debug("NYSE halts заявката се провали - пропускам resume-diff тази обиколка.")
         cutoff = now - RESUME_SIGNAL_WINDOW_MINUTES * 60
         _recently_resumed = {

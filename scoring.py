@@ -21,12 +21,6 @@ WEIGHTS = {
     "no_dilution_filing": 5,  # без скорошен S-1/S-3/424B filing
 }
 
-# ВАЖНО (18.09, намерено при цялостен преглед на кода): преди тук стояха
-# HIGH_POTENTIAL_THRESHOLD/EXIT_THRESHOLD като hardcoded module константи,
-# БЕЗ import config - т.е. промяна на HIGH_POTENTIAL_THRESHOLD през .env/
-# Render Environment Variables нямаше НИКАКЪВ ефект. Сега четем директно от
-# config.py (виж коментара там) - стойностите по подразбиране са същите.
-
 
 @dataclass
 class ScoreResult:
@@ -39,17 +33,6 @@ class ScoreResult:
 
     @property
     def is_high_potential(self) -> bool:
-        # ВАЖНО (18.09, намерено в реален Render лог): активен S-1/S-3/424B
-        # dilution filing преди коства само WEIGHTS["no_dilution_filing"] (5
-        # точки от 100) - лесно компенсирано от силни технически показатели.
-        # Реален случай: TEAD score=75 (над прага 70) SЪС активен dilution
-        # filing флаг - пратихме "ВИСОК ПОТЕНЦИАЛ" алърт за компания, която
-        # буквално обявява, че се готви да размие акционерите - класически
-        # ценови убиец, независимо колко добър изглежда графиката точно сега.
-        # Същия принцип като danger-флаговете в MemecoinScanner: активен
-        # dilution filing вече спира "ВИСОК ПОТЕНЦИАЛ" алърта твърдо,
-        # независимо от score-а - тикерът остава в watchlist-а (виж
-        # should_stay_in_watchlist), просто не се праща actionable email.
         return self.score >= config.HIGH_POTENTIAL_THRESHOLD and self.has_catalyst and not self.has_dilution_risk
 
     @property
