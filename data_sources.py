@@ -5,7 +5,9 @@ Wrapper-и около външните API-та. Всеки метод връщ�
 """
 import time
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 import requests
 import pandas as pd
@@ -99,8 +101,7 @@ def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", lim
     feed, но е много по-пълен от самостоятелния безплатен IEX feed."""
     try:
         import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period=period, interval=interval, prepost=True)
+        df = yf.Ticker(symbol).history(period=period, interval=interval, prepost=True)
         if df.empty:
             return pd.DataFrame()
         df = df.rename(columns={
@@ -110,6 +111,71 @@ def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", lim
     except Exception as e:
         log.warning("yfinance bars fail за %s: %s", symbol, e)
         return pd.DataFrame()
+
+
+class FMPClient:
+    BASE = "https://financialmodelingprep.com/stable"
+
+    def __init__(self):
+        self.key = config.FMP_API_KEY
+
+    def stock_news(self, symbol: str, limit: int = 10):
+        if not self.key:
+            return []
+        try:
+            r = requests.get(
+                f"{self.BASE}/news/stock",
+                params={"symbols": symbol, "limit": limit, "apikey": self.key},
+                timeout=10,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            log.warning(f"FMP news fail за {symbol}: {e}")
+            return []
+
+
+def get_google_news_rss(symbol: str, limit: int = 5) -> list:
+    """НОВ безплатен fallback за news catalyst (23.09) - виж бележката в
+    main.py::_has_news_catalyst за защо се появи: FMPClient.stock_news
+    започна да връща 402 Payment Required (текущият FMP ключ на потребителя
+    не покрива news endpoint-а - изисква платен план, потвърдено в живи
+    Render логове), а самостоятелно Alpaca News API + Finnhub company-news
+    имат доста тясно безплатно покритие точно за нискoликвидни penny
+    stocks. Google News RSS е напълно безплатен, БЕЗ API ключ, без
+    официален договор за стабилност (Google може да го промени/спре по
+    всяко време, без предупреждение) - затова е ДОПЪЛНИТЕЛЕН fallback, не
+    замяна на другите.
+
+    ЧЕСТНА БЕЛЕЖКА за качеството: заявката е нарочно стеснена с финансови
+    ключови думи (stock/shares/nasdaq/nyse/trading), за да намали шанса за
+    напълно ирелевантни съвпадения при тикери, които са и обикновени думи
+    (напр. "SOS") - но не е перфектно, все пак е текстово търсене, не
+    директна ticker->company справка. Тъй като catalyst=True е ТВЪРДО
+    условие (AND, не просто точки) за 'ВИСОК ПОТЕНЦИАЛ' алърт (виж
+    scoring.py::ScoreResult.is_high_potential), фалшиво съвпадение тук може
+    да допринесе за алърт, който технически не би трябвало да излезе - виж
+    README.md, ако искаш да изключиш този fallback (просто не го викай в
+    main.py)."""
+    query = quote(f'"{symbol}" (stock OR shares OR nasdaq OR nyse OR trading)')
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        items = root.findall(".//item")[:limit]
+        return [
+            {
+                "title": (item.findtext("title") or "").strip(),
+                "link": (item.findtext("link") or "").strip(),
+                "published": (item.findtext("pubDate") or "").strip(),
+            }
+            for item in items
+            if item.findtext("title")
+        ]
+    except Exception as e:
+        log.warning(f"Google News RSS fail за {symbol}: {e}")
+        return []
 
 
 def get_sec_dilution_flags(symbol: str) -> dict:
