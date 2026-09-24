@@ -112,6 +112,32 @@ def send_alert(kind: str, result: ScoreResult) -> bool:
     return _send_email(subject=f"[Penny Stock Scanner] {result.symbol} - {kind}", body=message)
 
 
+def send_volume_surge_alert(symbol: str, price, change_pct, prev_volume: int, current_volume: int, increase: int) -> bool:
+    """Отделен, БЪРЗ сигнал (24.09, по избор на потребителя) - виж
+    config.VOLUME_SURGE_* за пълния контекст. НЕ минава през score_symbol() -
+    само суров обемен скок, БЕЗ catalyst/dilution/технически проверки -
+    нарочен компромис в полза на скоростта (реален случай, довел до тази
+    функция: TNL Mediagene - алъртът по обичайния път дойде чак СЛЕД като
+    движението вече беше приключило). Затова имейлът изрично казва на
+    потребителя да провери сам, преди да реагира.
+
+    Същия контракт като send_alert(): True = "обработено" (пратен, изключен,
+    или извън часовете), False само ако anti-spam темпото го е пропуснало."""
+    message = (
+        f"[ОБЕМЕН СКОК] {symbol}\n"
+        f"Цена: ${price}" + (f" ({change_pct:+.1f}% днес)" if isinstance(change_pct, (int, float)) else "") + "\n"
+        f"Обем: {prev_volume:,} → {current_volume:,} (+{increase:,} за последните "
+        f"~{config.VOLUME_SURGE_INTERVAL_MINUTES} мин)\n"
+        "⚠️ Само обемен сигнал - БЕЗ проверка за новина/catalyst или dilution риск - "
+        "провери сам преди да влезеш, това е нарочно по-бърз, по-суров сигнал."
+    )
+    log.info("ОБЕМЕН СКОК:\n%s", message)
+
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    return _send_email(subject=f"[Penny Stock Scanner] {symbol} - ОБЕМЕН СКОК", body=message)
+
+
 def _send_email(subject: str, body: str) -> bool:
     if not (config.RESEND_API_KEY and config.ALERT_EMAIL_TO):
         log.warning("Email алъртите са включени, но RESEND_API_KEY или ALERT_EMAIL_TO не са попълнени.")

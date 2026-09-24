@@ -29,13 +29,16 @@ import schedule
 from flask import Flask
 
 import config
-from data_sources import AlpacaClient, FinnhubClient, FMPClient, get_sec_dilution_flags, get_bars_yfinance
+from data_sources import (
+    AlpacaClient, FinnhubClient, FMPClient, get_sec_dilution_flags, get_bars_yfinance,
+    get_google_news_rss,
+)
 from halts import get_recently_resumed
 from indicators import compute_all
 from scoring import score_symbol
-from universe import get_universe
+from universe import get_universe, get_volume_snapshot
 from watchlist import load_watchlist, save_watchlist, update_watchlist
-from notifier import send_alert
+from notifier import send_alert, send_volume_surge_alert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,6 +72,9 @@ REQUIRED_CONFIG_ATTRS = [
     "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN",
     "ALERT_ACTIVE_START_HOUR", "ALERT_ACTIVE_START_MINUTE",
     "ALERT_ACTIVE_END_HOUR", "ALERT_ACTIVE_END_MINUTE",
+    # --- добавени 24.09 - "обемен скок" бърз сигнал, по избор на потребителя ---
+    "VOLUME_SURGE_ENABLED", "VOLUME_SURGE_INTERVAL_MINUTES",
+    "VOLUME_SURGE_MIN_INCREASE", "VOLUME_SURGE_COOLDOWN_MINUTES",
 ]
 
 
@@ -153,7 +159,20 @@ def _has_news_catalyst(symbol: str, resumed_symbols: set) -> bool:
         # когато безплатните ни новинарски източници още не са го хванали.
         # Виж halts.py за защо не пращаме алърт директно на "спрян" статус.
         return True
-    news = alpaca.get_news(symbol, limit=5) or finnhub.company_news(symbol, days_back=2) or fmp.stock_news(symbol, limit=5)
+    # ВАЖНО (23.09, намерено в живи Render логове - "FMP news fail ... 402
+    # Payment Required" за почти всеки тикер): текущият FMP ключ на
+    # потребителя не покрива news endpoint-а (изисква платен план) - FMP
+    # практически НИКОГА не връща резултат вече, само шум в логовете.
+    # Добавихме get_google_news_rss() (виж data_sources.py за пълния
+    # research/honest tradeoff контекст) МЕЖДУ Finnhub и FMP - безплатен,
+    # без ключ - за да не разчитаме само на Alpaca+Finnhub, докато FMP
+    # реално не работи с този ключ.
+    news = (
+        alpaca.get_news(symbol, limit=5)
+        or finnhub.company_news(symbol, days_back=2)
+        or get_google_news_rss(symbol, limit=5)
+        or fmp.stock_news(symbol, limit=5)
+    )
     return bool(news)
 
 
@@ -346,15 +365,66 @@ def run_full_scan():
     )
 
 
+# --- "Обемен скок" - виж config.VOLUME_SURGE_* и notifier.send_volume_surge_alert
+# за пълния контекст (24.09, по избор на потребителя). И двата dict-а са
+# нарочно само в паметта на процеса - нулират се при redeploy/restart, виж
+# коментара в config.py защо това е приемлив компромис тук.
+_volume_baseline: dict = {}       # symbol -> последно видян обем
+_volume_last_alert_at: dict = {}  # symbol -> datetime на последния изпратен алърт
+
+
+def run_volume_surge_scan():
+    """Отделен, БЪРЗ цикъл (на всеки config.VOLUME_SURGE_INTERVAL_MINUTES) -
+    следи резки скокове в обема директно от StockAnalysis.com-ските
+    gainers/losers/active списъци, НЕЗАВИСИМО от watchlist-а/score_symbol()
+    конвейера по-горе. Целта е скорост: да хванем движение като TNL
+    Mediagene/TNMG (реалният случай, докладван от потребителя, довел до тази
+    функция) докато СЕ случва, не чак след като вече е приключило."""
+    if not config.VOLUME_SURGE_ENABLED:
+        return
+    if not _is_market_hours():
+        return
+    try:
+        snapshot = get_volume_snapshot()
+    except Exception as e:
+        log.warning("Обемен скок сканиране се провали: %s", e)
+        return
+
+    now = datetime.now(timezone.utc)
+    for symbol, data in snapshot.items():
+        volume = data.get("volume")
+        if volume is None:
+            continue
+        prev_volume = _volume_baseline.get(symbol)
+        _volume_baseline[symbol] = volume
+        if prev_volume is None:
+            continue  # първи път виждаме тикера тази сесия - само записваме базата, без алърт
+
+        increase = volume - prev_volume
+        if increase < config.VOLUME_SURGE_MIN_INCREASE:
+            continue
+
+        last_alert = _volume_last_alert_at.get(symbol)
+        if last_alert and (now - last_alert).total_seconds() < config.VOLUME_SURGE_COOLDOWN_MINUTES * 60:
+            continue  # вече алъртнахме за този тикер наскоро - изчакваме cooldown-а, за да не спамим
+
+        if send_volume_surge_alert(symbol, data.get("price"), data.get("change_pct"), prev_volume, volume, increase):
+            _volume_last_alert_at[symbol] = now
+
+    log.info("Обемен скок сканиране: %d тикера прегледани.", len(snapshot))
+
+
 def _scan_loop():
     log.info(
         "Penny Stock Scanner фонов loop стартира. Universe price cap: $%.2f, watchlist size: %d, "
-        "fast check на всеки %d мин, пълно сканиране на всеки %d мин.",
+        "fast check на всеки %d мин, пълно сканиране на всеки %d мин, обемен скок на всеки %d мин (enabled=%s).",
         config.MAX_UNIVERSE_PRICE, config.WATCHLIST_SIZE, config.FAST_INTERVAL_MINUTES, config.SCAN_INTERVAL_MINUTES,
+        config.VOLUME_SURGE_INTERVAL_MINUTES, config.VOLUME_SURGE_ENABLED,
     )
     run_full_scan()  # веднага при старт, после по разписание
     schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(run_full_scan)
     schedule.every(config.FAST_INTERVAL_MINUTES).minutes.do(run_fast_check)
+    schedule.every(config.VOLUME_SURGE_INTERVAL_MINUTES).minutes.do(run_volume_surge_scan)
     while True:
         schedule.run_pending()
         time.sleep(15)

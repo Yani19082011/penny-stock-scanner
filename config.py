@@ -77,6 +77,31 @@ SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "10"))
 # алърти без да чакаме следващото пълно сканиране.
 FAST_INTERVAL_MINUTES = int(os.getenv("FAST_INTERVAL_MINUTES", "2"))
 
+# --- "Обемен скок" - отделен, БЪРЗ сигнал (24.09, по изричен избор на
+# потребителя, след реален случай: TNL Mediagene/TNMG - алъртът дойде чак
+# СЛЕД като голямото дневно движение вече беше приключило и цената се беше
+# върнала надолу). Идеята, взаимствана от IBKR-ския "Trading Station"-стил
+# volume scanner: провери на всеки VOLUME_SURGE_INTERVAL_MINUTES дали обемът
+# на даден тикер е скочил с поне VOLUME_SURGE_MIN_INCREASE акции спрямо
+# предишната проверка - ако да, изпрати ВЕДНАГА сигнал, БЕЗ да чакаме
+# score_symbol()/watchlist конвейера (виж main.py::run_volume_surge_scan).
+#
+# ЧЕСТНА БЕЛЕЖКА: това е нарочно по-суров, по-бърз сигнал от обичайния
+# "ВИСОК ПОТЕНЦИАЛ" алърт - БЕЗ catalyst/dilution/технически проверки -
+# компромис в полза на скоростта, ще имаш повече false positives. Данните
+# идват от StockAnalysis.com-ските gainers/losers/active списъци (единствен
+# от двата безплатни universe източника, който дава реален volume - виж
+# universe.py). Base line-ът е само в паметта на процеса - нулира се при
+# redeploy/restart (чест случай на Render free tier) - първият цикъл след
+# рестарт просто записва текущия обем, без да алъртва.
+VOLUME_SURGE_ENABLED = os.getenv("VOLUME_SURGE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+VOLUME_SURGE_INTERVAL_MINUTES = int(os.getenv("VOLUME_SURGE_INTERVAL_MINUTES", "5"))
+VOLUME_SURGE_MIN_INCREASE = int(os.getenv("VOLUME_SURGE_MIN_INCREASE", "3000000"))
+# Cooldown, за да не пращаме нов имейл на всеки 5 мин, докато един и същ
+# тикер продължава да търгува тежко (без това - "обемен скок" алъртите биха
+# удавили пощата ти при дълго рали).
+VOLUME_SURGE_COOLDOWN_MINUTES = int(os.getenv("VOLUME_SURGE_COOLDOWN_MINUTES", "30"))
+
 # --- Защита срещу "купуване на върха" (същия проблем, докладван при
 # memecoin бота на 17.09 - алърт точно на върха на кратък spike, цената
 # пада веднага след получаване на имейла). Изисква score-ът да е над

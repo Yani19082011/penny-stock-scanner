@@ -161,6 +161,35 @@ def _fetch_stockanalysis_movers(slug: str) -> list[dict]:
     return results
 
 
+def get_volume_snapshot() -> dict:
+    """Директен {symbol: {"price", "change_pct", "volume"}} snapshot от
+    StockAnalysis.com-ските movers страници - единственият от двата
+    безплатни universe източника тук, който дава РЕАЛЕН volume (виж
+    бележката горе за FMP movers, които нямат volume поле изобщо).
+
+    Ползва се от main.py::run_volume_surge_scan на всеки config.
+    VOLUME_SURGE_INTERVAL_MINUTES (5 мин по подразбиране) - НЕЗАВИСИМО от
+    обичайния get_universe()/пълния scan цикъл (10 мин по подразбиране),
+    за да хванем рязък обемен скок възможно най-бързо (24.09, по избор на
+    потребителя, след реален случай на закъснял алърт - виж config.py)."""
+    snapshot: dict[str, dict] = {}
+    for slug in STOCKANALYSIS_SLUGS:
+        for row in _fetch_stockanalysis_movers(slug):
+            symbol = row.get("symbol")
+            price = row.get("price")
+            volume = row.get("volume")
+            if not symbol or price is None or volume is None:
+                continue
+            if symbol in LARGE_CAP_BLOCKLIST or price > config.MAX_UNIVERSE_PRICE:
+                continue
+            snapshot[symbol] = {
+                "price": price,
+                "change_pct": row.get("change_pct"),
+                "volume": volume,
+            }
+    return snapshot
+
+
 def _passes_market_cap_filter(symbol: str) -> bool:
     """Best-effort проверка през Finnhub - само за кандидати, за които
     НЯМАМЕ директен marketCap от StockAnalysis.com (виж get_universe)."""
