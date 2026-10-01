@@ -113,6 +113,54 @@ def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", lim
         return pd.DataFrame()
 
 
+def get_minute_bars_batch(symbols: list[str], lookback_minutes: int = 15) -> dict[str, "pd.DataFrame"]:
+    """Bulk 1-минутни свещи за НЯКОЛКО тикера наведнъж (yfinance) - за
+    main.py::run_price_spike_scan (01.10, по изрична спецификация на
+    потребителя за ценови+обемен scanner). Едно yf.download() повикване за
+    целия списък е по-леко за yfinance-ския (неофициален, reverse-engineered)
+    rate limit, отколкото по едно отделно повикване на тикер - но пак не е
+    гарантирано (виж честите 429 предупреждения в живите Render логове) -
+    при частичен провал просто връщаме каквото е успяло да се свали +
+    warning в лога, НЕ гърмим целия scan заради един лош тикер.
+
+    prepost=True включва pre/post market свещи - нужно е изрично, за да
+    хванем pre-market скок (целта на цялата функция - потребителят иска да
+    влиза 10-15 мин ПРЕДИ скока, обичайно точно в pre-market)."""
+    result: dict = {}
+    if not symbols:
+        return result
+    try:
+        import yfinance as yf
+        data = yf.download(
+            tickers=" ".join(symbols), period="1d", interval="1m",
+            group_by="ticker", prepost=True, progress=False, threads=True,
+        )
+    except Exception as e:
+        log.warning("yfinance bulk 1-мин свещи се провалиха за %d тикера: %s", len(symbols), e)
+        data = None
+
+    if data is not None and not data.empty:
+        for symbol in symbols:
+            try:
+                df = data[symbol] if len(symbols) > 1 else data
+                df = df.rename(columns={
+                    "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume",
+                })
+                df = df.dropna(subset=["close", "volume"])
+                if not df.empty:
+                    result[symbol] = df[["open", "high", "low", "close", "volume"]].tail(lookback_minutes)
+            except Exception:
+                continue  # този тикер липсва/друга форма в bulk резултата - individualния fallback по-долу го хваща
+
+    # Fallback поотделно само за тикерите, които bulk заявката не покри.
+    missing = [s for s in symbols if s not in result]
+    for symbol in missing:
+        df = get_bars_yfinance(symbol, interval="1m", period="1d", limit=lookback_minutes)
+        if not df.empty:
+            result[symbol] = df
+    return result
+
+
 class FMPClient:
     BASE = "https://financialmodelingprep.com/stable"
 

@@ -1,8 +1,11 @@
 """
-Изпращане на алърти. Два канала:
+Изпращане на алърти. Три канала:
   - лог (винаги, вижда се в Render "Logs" таба)
   - email през Resend (https://resend.com) - HTTP API, само ако
     ALERT_EMAIL_ENABLED=true и RESEND_API_KEY е попълнен.
+  - Telegram (01.10) - само за "ЦЕНОВИ СКОК" сигналите (виж
+    send_price_spike_alert), само ако TELEGRAM_ENABLED=true и
+    TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID са попълнени - виж README.md.
 
 Забележка: НЕ ползваме Gmail SMTP/App Password, защото Google не позволява
 App Passwords на Family Link (supervised) акаунти. Resend е безплатна услуга,
@@ -112,30 +115,65 @@ def send_alert(kind: str, result: ScoreResult) -> bool:
     return _send_email(subject=f"[Penny Stock Scanner] {result.symbol} - {kind}", body=message)
 
 
-def send_volume_surge_alert(symbol: str, price, change_pct, prev_volume: int, current_volume: int, increase: int) -> bool:
-    """Отделен, БЪРЗ сигнал (24.09, по избор на потребителя) - виж
-    config.VOLUME_SURGE_* за пълния контекст. НЕ минава през score_symbol() -
-    само суров обемен скок, БЕЗ catalyst/dilution/технически проверки -
-    нарочен компромис в полза на скоростта (реален случай, довел до тази
-    функция: TNL Mediagene - алъртът по обичайния път дойде чак СЛЕД като
-    движението вече беше приключило). Затова имейлът изрично казва на
-    потребителя да провери сам, преди да реагира.
+TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
-    Същия контракт като send_alert(): True = "обработено" (пратен, изключен,
-    или извън часовете), False само ако anti-spam темпото го е пропуснало."""
+
+def send_telegram_message(text: str) -> bool:
+    """Праща съобщение през Telegram Bot API - прост HTTP POST, без
+    допълнителна библиотека (01.10, виж README.md за стъпките да си
+    направиш бот през @BotFather и да вземеш chat_id-то си). Връща True само
+    при реално успешно изпратено съобщение - False ако Telegram не е
+    конфигуриран/включен, или заявката се провали (извикващият код тогава
+    решава дали да пробва email fallback - виж send_price_spike_alert)."""
+    if not (config.TELEGRAM_ENABLED and config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
+        return False
+    try:
+        resp = requests.post(
+            TELEGRAM_API_URL.format(token=config.TELEGRAM_BOT_TOKEN),
+            json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text},
+            timeout=15,
+        )
+        if resp.status_code >= 300:
+            log.error("Telegram отказа изпращането (%s): %s", resp.status_code, resp.text)
+            return False
+        log.info("Telegram алърт изпратен успешно.")
+        return True
+    except Exception as e:
+        log.error("Изпращането през Telegram се провали: %s", e)
+        return False
+
+
+def send_price_spike_alert(symbol: str, price, price_change_pct, last_minute_volume, avg_prior_volume, dollar_volume) -> bool:
+    """"ЦЕНОВИ СКОК" сигнал (01.10, по ТОЧНА спецификация на потребителя -
+    заменя старата send_volume_surge_alert). Условията (топ-N по dollar
+    volume + обем последна минута >= Nx средния + цена нагоре >= X% за N мин)
+    вече са проверени в main.py::run_price_spike_scan ПРЕДИ да се стигне
+    дотук - тук само форматираме и пращаме.
+
+    Канал: Telegram (config.TELEGRAM_*) - по избор на потребителя, за
+    по-бързо известяване на телефона, вместо email. Ако Telegram не е
+    конфигуриран/се провали, пада обратно на email (ако е включен) - по-добре
+    закъснял email, отколкото напълно изгубен сигнал.
+
+    НИКОГА не пуска поръчка - само наблюдава и известява, потребителят решава
+    сам дали и как да влезе (виж README.md)."""
     message = (
-        f"[ОБЕМЕН СКОК] {symbol}\n"
-        f"Цена: ${price}" + (f" ({change_pct:+.1f}% днес)" if isinstance(change_pct, (int, float)) else "") + "\n"
-        f"Обем: {prev_volume:,} → {current_volume:,} (+{increase:,} за последните "
-        f"~{config.VOLUME_SURGE_INTERVAL_MINUTES} мин)\n"
-        "⚠️ Само обемен сигнал - БЕЗ проверка за новина/catalyst или dilution риск - "
-        "провери сам преди да влезеш, това е нарочно по-бърз, по-суров сигнал."
+        f"🚀 ЦЕНОВИ СКОК: {symbol}\n"
+        f"Цена: ${price:.4f}"
+        + (f" ({price_change_pct:+.1f}% за последните {config.PRICE_SPIKE_PRICE_LOOKBACK_MINUTES} мин)" if price_change_pct is not None else "")
+        + "\n"
+        f"Обем последна минута: {last_minute_volume:,.0f} "
+        f"(средно предходни {config.PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES} мин: {avg_prior_volume:,.0f})\n"
+        f"Dollar volume днес: ${dollar_volume:,.0f}\n"
+        "⚠️ Само наблюдение - БОТЪТ НЕ пуска поръчки - провери сам графиката/новините преди да влезеш."
     )
-    log.info("ОБЕМЕН СКОК:\n%s", message)
+    log.info("ЦЕНОВИ СКОК:\n%s", message)
 
+    if send_telegram_message(message):
+        return True
     if not config.ALERT_EMAIL_ENABLED:
         return True
-    return _send_email(subject=f"[Penny Stock Scanner] {symbol} - ОБЕМЕН СКОК", body=message)
+    return _send_email(subject=f"[Penny Stock Scanner] {symbol} - ЦЕНОВИ СКОК", body=message)
 
 
 def _send_email(subject: str, body: str) -> bool:

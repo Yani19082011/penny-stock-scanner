@@ -31,14 +31,14 @@ from flask import Flask
 import config
 from data_sources import (
     AlpacaClient, FinnhubClient, FMPClient, get_sec_dilution_flags, get_bars_yfinance,
-    get_google_news_rss,
+    get_google_news_rss, get_minute_bars_batch,
 )
 from halts import get_recently_resumed
 from indicators import compute_all
 from scoring import score_symbol
-from universe import get_universe, get_volume_snapshot
+from universe import get_universe, get_volume_snapshot, rank_by_dollar_volume
 from watchlist import load_watchlist, save_watchlist, update_watchlist
-from notifier import send_alert, send_volume_surge_alert
+from notifier import send_alert, send_price_spike_alert, send_telegram_message
 
 logging.basicConfig(
     level=logging.INFO,
@@ -72,9 +72,14 @@ REQUIRED_CONFIG_ATTRS = [
     "UPSTASH_REDIS_REST_URL", "UPSTASH_REDIS_REST_TOKEN",
     "ALERT_ACTIVE_START_HOUR", "ALERT_ACTIVE_START_MINUTE",
     "ALERT_ACTIVE_END_HOUR", "ALERT_ACTIVE_END_MINUTE",
-    # --- добавени 24.09 - "обемен скок" бърз сигнал, по избор на потребителя ---
-    "VOLUME_SURGE_ENABLED", "VOLUME_SURGE_INTERVAL_MINUTES",
-    "VOLUME_SURGE_MIN_INCREASE", "VOLUME_SURGE_COOLDOWN_MINUTES",
+    # --- добавени 01.10 - "ЦЕНОВИ СКОК" v2 (замества старото "ОБЕМЕН СКОК"),
+    # по ТОЧНА спецификация на потребителя - виж config.py за пълния контекст ---
+    "PRICE_SPIKE_ENABLED", "PRICE_SPIKE_INTERVAL_MINUTES",
+    "PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES", "PRICE_SPIKE_TOP_N",
+    "PRICE_SPIKE_MIN_DOLLAR_VOLUME", "PRICE_SPIKE_VOLUME_MULTIPLIER",
+    "PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES", "PRICE_SPIKE_MIN_PRICE_CHANGE_PCT",
+    "PRICE_SPIKE_PRICE_LOOKBACK_MINUTES", "PRICE_SPIKE_COOLDOWN_MINUTES",
+    "TELEGRAM_ENABLED", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 ]
 
 
@@ -151,6 +156,20 @@ def test_email():
     if not config.RESEND_API_KEY:
         return {"sent": False, "reason": "RESEND_API_KEY липсва - провери Render Environment Variables."}
     return {"sent": True, "to": config.ALERT_EMAIL_TO, "note": "Провери логовете (Logs таб) и пощата си."}
+
+
+@app.route("/test-telegram")
+def test_telegram():
+    """Изпраща тестово Telegram съобщение, за да провериш дали
+    TELEGRAM_ENABLED/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID са настроени
+    правилно (виж README.md за стъпките през @BotFather). Просто отвори този
+    URL в браузъра веднъж."""
+    if not config.TELEGRAM_ENABLED:
+        return {"sent": False, "reason": "TELEGRAM_ENABLED е false - провери Render Environment Variables."}
+    if not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
+        return {"sent": False, "reason": "TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID липсват."}
+    ok = send_telegram_message("✅ Тестово съобщение от Penny Stock Scanner - Telegram връзката работи!")
+    return {"sent": ok, "note": "Провери логовете (Logs таб) и Telegram чата си."}
 
 
 def _has_news_catalyst(symbol: str, resumed_symbols: set) -> bool:
@@ -365,66 +384,111 @@ def run_full_scan():
     )
 
 
-# --- "Обемен скок" - виж config.VOLUME_SURGE_* и notifier.send_volume_surge_alert
-# за пълния контекст (24.09, по избор на потребителя). И двата dict-а са
-# нарочно само в паметта на процеса - нулират се при redeploy/restart, виж
-# коментара в config.py защо това е приемлив компромис тук.
-_volume_baseline: dict = {}       # symbol -> последно видян обем
-_volume_last_alert_at: dict = {}  # symbol -> datetime на последния изпратен алърт
+# --- "ЦЕНОВИ СКОК" v2 - виж config.PRICE_SPIKE_* и notifier.send_price_spike_alert
+# за пълния контекст (01.10, по ТОЧНА спецификация на потребителя, заменя
+# старото "ОБЕМЕН СКОК"). Кешът и cooldown dict-ът са нарочно само в паметта
+# на процеса - нулират се при redeploy/restart (виж config.py).
+_price_spike_universe: list = []       # кеширан топ-N списък (dict-ове от universe.rank_by_dollar_volume)
+_price_spike_last_alert_at: dict = {}  # symbol -> datetime на последния изпратен алърт (15-мин cooldown)
 
 
-def run_volume_surge_scan():
-    """Отделен, БЪРЗ цикъл (на всеки config.VOLUME_SURGE_INTERVAL_MINUTES) -
-    следи резки скокове в обема директно от StockAnalysis.com-ските
-    gainers/losers/active списъци, НЕЗАВИСИМО от watchlist-а/score_symbol()
-    конвейера по-горе. Целта е скорост: да хванем движение като TNL
-    Mediagene/TNMG (реалният случай, докладван от потребителя, довел до тази
-    функция) докато СЕ случва, не чак след като вече е приключило."""
-    if not config.VOLUME_SURGE_ENABLED:
-        return
-    if not _is_market_hours():
+def run_price_spike_universe_refresh():
+    """По-рядкият от двата цикъла на тази функция (на всеки config.
+    PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES) - опреснява топ-N списъка по
+    dollar volume (условие 1 от спецификацията). run_price_spike_scan()
+    по-долу (на всеки 1 мин по подразбиране) винаги чете последния кеширан
+    списък тук, вместо да удря StockAnalysis.com всяка минута."""
+    global _price_spike_universe
+    if not config.PRICE_SPIKE_ENABLED or not _is_market_hours():
         return
     try:
         snapshot = get_volume_snapshot()
+        _price_spike_universe = rank_by_dollar_volume(
+            snapshot, config.PRICE_SPIKE_TOP_N, config.PRICE_SPIKE_MIN_DOLLAR_VOLUME,
+        )
+        log.info(
+            "Ценови скок: опреснен топ списък (%d тикера над $%.0f dollar volume): %s",
+            len(_price_spike_universe), config.PRICE_SPIKE_MIN_DOLLAR_VOLUME,
+            [row["symbol"] for row in _price_spike_universe],
+        )
     except Exception as e:
-        log.warning("Обемен скок сканиране се провали: %s", e)
+        log.warning("Ценови скок: опресняването на топ списъка се провали: %s", e)
+
+
+def run_price_spike_scan():
+    """Проверява условия 2 и 3 от спецификацията (виж config.PRICE_SPIKE_*)
+    САМО върху последния кеширан топ-N списък (условие 1, вече филтрирано от
+    run_price_spike_universe_refresh по-горе). И ДВЕТЕ трябва да са верни
+    ЕДНОВРЕМЕННО:
+      2. обем последна минута >= PRICE_SPIKE_VOLUME_MULTIPLIER x средния обем
+         от предходните PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES минути
+      3. цената е нагоре >= PRICE_SPIKE_MIN_PRICE_CHANGE_PCT% за последните
+         PRICE_SPIKE_PRICE_LOOKBACK_MINUTES минути
+    Никога не пуска поръчка - само следи и известява."""
+    if not config.PRICE_SPIKE_ENABLED or not _is_market_hours():
+        return
+    if not _price_spike_universe:
+        return
+
+    symbols = [row["symbol"] for row in _price_spike_universe]
+    by_symbol = {row["symbol"]: row for row in _price_spike_universe}
+    needed_bars = max(config.PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES, config.PRICE_SPIKE_PRICE_LOOKBACK_MINUTES) + 1
+
+    try:
+        bars_by_symbol = get_minute_bars_batch(symbols, lookback_minutes=needed_bars + 5)
+    except Exception as e:
+        log.warning("Ценови скок сканиране: грешка при взимане на 1-мин свещи: %s", e)
         return
 
     now = datetime.now(timezone.utc)
-    for symbol, data in snapshot.items():
-        volume = data.get("volume")
-        if volume is None:
+    fired = []
+    for symbol, bars in bars_by_symbol.items():
+        if len(bars) < needed_bars:
+            continue  # недостатъчно 1-мин свещи още (напр. тъкмо отворила сесията) - прескачаме тази обиколка
+
+        volumes = bars["volume"]
+        last_minute_volume = volumes.iloc[-1]
+        prior_volumes = volumes.iloc[-(config.PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES + 1):-1]
+        avg_prior_volume = prior_volumes.mean() if len(prior_volumes) else 0
+        if avg_prior_volume <= 0 or last_minute_volume < config.PRICE_SPIKE_VOLUME_MULTIPLIER * avg_prior_volume:
+            continue  # условие 2 не е изпълнено
+
+        closes = bars["close"]
+        price_now = closes.iloc[-1]
+        price_then = closes.iloc[-(config.PRICE_SPIKE_PRICE_LOOKBACK_MINUTES + 1)]
+        if not price_then:
             continue
-        prev_volume = _volume_baseline.get(symbol)
-        _volume_baseline[symbol] = volume
-        if prev_volume is None:
-            continue  # първи път виждаме тикера тази сесия - само записваме базата, без алърт
+        price_change_pct = (price_now - price_then) / price_then * 100
+        if price_change_pct < config.PRICE_SPIKE_MIN_PRICE_CHANGE_PCT:
+            continue  # условие 3 не е изпълнено
 
-        increase = volume - prev_volume
-        if increase < config.VOLUME_SURGE_MIN_INCREASE:
-            continue
+        last_alert = _price_spike_last_alert_at.get(symbol)
+        if last_alert and (now - last_alert).total_seconds() < config.PRICE_SPIKE_COOLDOWN_MINUTES * 60:
+            continue  # вече алъртнахме за този тикер наскоро - cooldown, дори да продължава да отговаря на условията
 
-        last_alert = _volume_last_alert_at.get(symbol)
-        if last_alert and (now - last_alert).total_seconds() < config.VOLUME_SURGE_COOLDOWN_MINUTES * 60:
-            continue  # вече алъртнахме за този тикер наскоро - изчакваме cooldown-а, за да не спамим
+        dollar_volume = by_symbol.get(symbol, {}).get("dollar_volume") or (price_now * volumes.sum())
+        if send_price_spike_alert(symbol, price_now, price_change_pct, last_minute_volume, avg_prior_volume, dollar_volume):
+            _price_spike_last_alert_at[symbol] = now
+            fired.append(symbol)
 
-        if send_volume_surge_alert(symbol, data.get("price"), data.get("change_pct"), prev_volume, volume, increase):
-            _volume_last_alert_at[symbol] = now
-
-    log.info("Обемен скок сканиране: %d тикера прегледани.", len(snapshot))
+    if fired:
+        log.info("Ценови скок сканиране: сигнал за %s", fired)
 
 
 def _scan_loop():
     log.info(
         "Penny Stock Scanner фонов loop стартира. Universe price cap: $%.2f, watchlist size: %d, "
-        "fast check на всеки %d мин, пълно сканиране на всеки %d мин, обемен скок на всеки %d мин (enabled=%s).",
+        "fast check на всеки %d мин, пълно сканиране на всеки %d мин, ценови скок на всеки %d мин "
+        "(топ опреснен на всеки %d мин, enabled=%s).",
         config.MAX_UNIVERSE_PRICE, config.WATCHLIST_SIZE, config.FAST_INTERVAL_MINUTES, config.SCAN_INTERVAL_MINUTES,
-        config.VOLUME_SURGE_INTERVAL_MINUTES, config.VOLUME_SURGE_ENABLED,
+        config.PRICE_SPIKE_INTERVAL_MINUTES, config.PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES, config.PRICE_SPIKE_ENABLED,
     )
     run_full_scan()  # веднага при старт, после по разписание
+    run_price_spike_universe_refresh()
     schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(run_full_scan)
     schedule.every(config.FAST_INTERVAL_MINUTES).minutes.do(run_fast_check)
-    schedule.every(config.VOLUME_SURGE_INTERVAL_MINUTES).minutes.do(run_volume_surge_scan)
+    schedule.every(config.PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES).minutes.do(run_price_spike_universe_refresh)
+    schedule.every(config.PRICE_SPIKE_INTERVAL_MINUTES).minutes.do(run_price_spike_scan)
     while True:
         schedule.run_pending()
         time.sleep(15)

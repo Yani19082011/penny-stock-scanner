@@ -167,10 +167,10 @@ def get_volume_snapshot() -> dict:
     безплатни universe източника тук, който дава РЕАЛЕН volume (виж
     бележката горе за FMP movers, които нямат volume поле изобщо).
 
-    Ползва се от main.py::run_volume_surge_scan на всеки config.
-    VOLUME_SURGE_INTERVAL_MINUTES (5 мин по подразбиране) - НЕЗАВИСИМО от
-    обичайния get_universe()/пълния scan цикъл (10 мин по подразбиране),
-    за да хванем рязък обемен скок възможно най-бързо (24.09, по избор на
+    Ползва се от main.py::run_price_spike_universe_refresh на всеки config.
+    PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES (5 мин по подразбиране) - НЕЗАВИСИМО
+    от обичайния get_universe()/пълния scan цикъл (10 мин по подразбиране),
+    за да хванем рязко движение възможно най-бързо (24.09/01.10, по избор на
     потребителя, след реален случай на закъснял алърт - виж config.py)."""
     snapshot: dict[str, dict] = {}
     for slug in STOCKANALYSIS_SLUGS:
@@ -188,6 +188,36 @@ def get_volume_snapshot() -> dict:
                 "volume": volume,
             }
     return snapshot
+
+
+def rank_by_dollar_volume(snapshot: dict, top_n: int, min_dollar_volume: float) -> list[dict]:
+    """Чиста функция (без мрежови повиквания - лесно се тества) за main.py::
+    run_price_spike_universe_refresh (01.10, по изрична спецификация на
+    потребителя). Взима snapshot-а от get_volume_snapshot() по-горе, смята
+    "dollar volume" = цена x дневен кумулативен обем, филтрира над
+    min_dollar_volume и връща низходящо сортиран списък, ограничен до top_n.
+
+    ЧЕСТНА БЕЛЕЖКА: дневен кумулативен обем, не истински 1-минутен dollar
+    volume - достатъчно добро безплатно приближение (виж config.py за пълния
+    контекст)."""
+    rows = []
+    for symbol, data in snapshot.items():
+        price = data.get("price")
+        volume = data.get("volume")
+        if price is None or volume is None:
+            continue
+        dollar_volume = price * volume
+        if dollar_volume <= min_dollar_volume:
+            continue
+        rows.append({
+            "symbol": symbol,
+            "price": price,
+            "change_pct": data.get("change_pct"),
+            "volume": volume,
+            "dollar_volume": dollar_volume,
+        })
+    rows.sort(key=lambda r: r["dollar_volume"], reverse=True)
+    return rows[:top_n]
 
 
 def _passes_market_cap_filter(symbol: str) -> bool:

@@ -77,30 +77,51 @@ SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "10"))
 # алърти без да чакаме следващото пълно сканиране.
 FAST_INTERVAL_MINUTES = int(os.getenv("FAST_INTERVAL_MINUTES", "2"))
 
-# --- "Обемен скок" - отделен, БЪРЗ сигнал (24.09, по изричен избор на
-# потребителя, след реален случай: TNL Mediagene/TNMG - алъртът дойде чак
-# СЛЕД като голямото дневно движение вече беше приключило и цената се беше
-# върнала надолу). Идеята, взаимствана от IBKR-ския "Trading Station"-стил
-# volume scanner: провери на всеки VOLUME_SURGE_INTERVAL_MINUTES дали обемът
-# на даден тикер е скочил с поне VOLUME_SURGE_MIN_INCREASE акции спрямо
-# предишната проверка - ако да, изпрати ВЕДНАГА сигнал, БЕЗ да чакаме
-# score_symbol()/watchlist конвейера (виж main.py::run_volume_surge_scan).
+# --- "ЦЕНОВИ СКОК" v2 (01.10, по ТОЧНА спецификация на потребителя - заменя
+# старата по-груба "ОБЕМЕН СКОК" версия отгоре, която гледаше само суров ръст
+# в обема без цена/класация). И ТРИТЕ условия по-долу трябва да са верни
+# ЕДНОВРЕМЕННО, за да изпрати сигнал:
+#   1. Тикерът е в топ PRICE_SPIKE_TOP_N по "dollar volume" (цена x дневен
+#      обем) И dollar volume > PRICE_SPIKE_MIN_DOLLAR_VOLUME.
+#   2. Обемът през ПОСЛЕДНАТА 1 минута >= PRICE_SPIKE_VOLUME_MULTIPLIER пъти
+#      средния обем от предходните PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES минути.
+#   3. Цената е НАГОРЕ >= PRICE_SPIKE_MIN_PRICE_CHANGE_PCT% за последните
+#      PRICE_SPIKE_PRICE_LOOKBACK_MINUTES минути.
+# Никога не пуска поръчка - само следи и известява (виж notifier.py).
 #
-# ЧЕСТНА БЕЛЕЖКА: това е нарочно по-суров, по-бърз сигнал от обичайния
-# "ВИСОК ПОТЕНЦИАЛ" алърт - БЕЗ catalyst/dilution/технически проверки -
-# компромис в полза на скоростта, ще имаш повече false positives. Данните
-# идват от StockAnalysis.com-ските gainers/losers/active списъци (единствен
-# от двата безплатни universe източника, който дава реален volume - виж
-# universe.py). Base line-ът е само в паметта на процеса - нулира се при
-# redeploy/restart (чест случай на Render free tier) - първият цикъл след
-# рестарт просто записва текущия обем, без да алъртва.
-VOLUME_SURGE_ENABLED = os.getenv("VOLUME_SURGE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
-VOLUME_SURGE_INTERVAL_MINUTES = int(os.getenv("VOLUME_SURGE_INTERVAL_MINUTES", "5"))
-VOLUME_SURGE_MIN_INCREASE = int(os.getenv("VOLUME_SURGE_MIN_INCREASE", "3000000"))
-# Cooldown, за да не пращаме нов имейл на всеки 5 мин, докато един и същ
-# тикер продължава да търгува тежко (без това - "обемен скок" алъртите биха
-# удавили пощата ти при дълго рали).
-VOLUME_SURGE_COOLDOWN_MINUTES = int(os.getenv("VOLUME_SURGE_COOLDOWN_MINUTES", "30"))
+# ЧЕСТНА БЕЛЕЖКА за данните: топ списъкът (условие 1) се смята от
+# universe.get_volume_snapshot() - дневен кумулативен обем от
+# StockAnalysis.com, не истински market-wide real-time dollar volume (няма
+# безплатен такъв източник) - и е ограничен до вече филтрираните "евтини"
+# тикери на бота (цена <= MAX_UNIVERSE_PRICE, без LARGE_CAP_BLOCKLIST), не
+# буквално целия пазар. 1-минутните свещи (условия 2 и 3) идват от yfinance
+# (безплатен, неофициален/reverse-engineered - виж data_sources.
+# get_minute_bars_batch) - очаквай редки 429 грешки в логовете, особено ако
+# свалиш PRICE_SPIKE_INTERVAL_MINUTES под 1 минута.
+PRICE_SPIKE_ENABLED = _bool("PRICE_SPIKE_ENABLED", True)
+# На колко минути да проверяваме 1-минутните условия (2 и 3) - по спецификация "последна минута".
+PRICE_SPIKE_INTERVAL_MINUTES = int(os.getenv("PRICE_SPIKE_INTERVAL_MINUTES", "1"))
+# На колко минути да опресняваме топ-N списъка по dollar volume (условие 1) -
+# по-рядко от самата проверка, за да пестим StockAnalysis.com заявките.
+PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES = int(os.getenv("PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES", "5"))
+PRICE_SPIKE_TOP_N = int(os.getenv("PRICE_SPIKE_TOP_N", "40"))
+PRICE_SPIKE_MIN_DOLLAR_VOLUME = float(os.getenv("PRICE_SPIKE_MIN_DOLLAR_VOLUME", "2000000"))
+PRICE_SPIKE_VOLUME_MULTIPLIER = float(os.getenv("PRICE_SPIKE_VOLUME_MULTIPLIER", "2"))
+PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES = int(os.getenv("PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES", "5"))
+PRICE_SPIKE_MIN_PRICE_CHANGE_PCT = float(os.getenv("PRICE_SPIKE_MIN_PRICE_CHANGE_PCT", "5"))
+PRICE_SPIKE_PRICE_LOOKBACK_MINUTES = int(os.getenv("PRICE_SPIKE_PRICE_LOOKBACK_MINUTES", "5"))
+# Cooldown - 1 сигнал на тикер на 15 мин, дори да продължава да отговаря на
+# условията (по изрична спецификация на потребителя).
+PRICE_SPIKE_COOLDOWN_MINUTES = int(os.getenv("PRICE_SPIKE_COOLDOWN_MINUTES", "15"))
+
+# --- Telegram известия (01.10, по избор на потребителя - "ЦЕНОВИ СКОК"
+# сигналите да идват в Telegram, не email, за по-бързо известяване на
+# телефона). Безплатно - виж README.md за стъпките през @BotFather. Ако не е
+# конфигуриран, send_price_spike_alert() пада обратно на email (ако e
+# включен) вместо да изгуби сигнала напълно. ---
+TELEGRAM_ENABLED = _bool("TELEGRAM_ENABLED", False)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # --- Защита срещу "купуване на върха" (същия проблем, докладван при
 # memecoin бота на 17.09 - алърт точно на върха на кратък spike, цената
