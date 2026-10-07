@@ -34,7 +34,7 @@ from data_sources import (
     get_google_news_rss, get_minute_bars_batch,
 )
 from halts import get_recently_resumed
-from indicators import compute_all
+from indicators import compute_daily_signals
 from scoring import score_symbol
 from universe import get_universe, get_volume_snapshot, rank_by_dollar_volume
 from watchlist import load_watchlist, save_watchlist, update_watchlist
@@ -95,10 +95,10 @@ def _startup_self_check():
         )
         raise SystemExit(1)
 
+    # (07.10) обновено за новата схема с 2 дневни сигнала (donchian_breakout /
+    # fib_retracement_bounce) - виж indicators.py/scoring.py за пълния контекст.
     fake_ind = {
-        "price": 3.5, "ema9": 3.4, "ema20": 3.2, "vwap": 3.3, "rsi14": 60.0,
-        "relative_volume": 4.0, "trend_up": True, "above_vwap": True,
-        "orb_breakout": "bullish", "support": 3.0, "resistance": 3.8, "bullish_candle": True,
+        "price": 3.5, "donchian_breakout": True, "fib_retracement_bounce": False,
     }
     try:
         score_symbol("SELFTEST", fake_ind, True, {"has_recent_dilution_filing": False})
@@ -223,7 +223,11 @@ def _is_market_hours() -> bool:
     return pre_market_start <= minutes <= regular_close
 
 
-_MIN_BARS_FOR_INDICATORS = 25  # виж indicators.compute_all() - под това връща {}
+# (07.10) обновено за новата ДНЕВНА схема (донован пробив/Fibonacci откат -
+# виж indicators.py/scoring.py) - виж min_len проверките в strategies.py
+# (donchian: channel_period+25=45, fib_retracement: swing_lookback+2=42);
+# тук искаме малко буфер над това.
+_MIN_DAILY_BARS_FOR_SIGNALS = 90
 
 
 def _score_symbols(symbols) -> list:
@@ -232,17 +236,16 @@ def _score_symbols(symbols) -> list:
     resumed_symbols = set(get_recently_resumed().keys())
     for symbol in symbols:
         try:
-            bars = alpaca.get_bars(symbol, timeframe="5Min", limit=100)
-            if len(bars) < _MIN_BARS_FOR_INDICATORS:
-                # Alpaca IEX е твърде тънък тук (чест случай в pre-market, или
-                # при силно неликвидни тикери дори през редовна сесия) -
-                # опитваме безплатния yfinance fallback (по-пълни, консолидирани
-                # данни, включително pre/post market), вместо просто да
-                # пропуснем кандидата.
-                fallback = get_bars_yfinance(symbol)
-                if len(fallback) > len(bars):
-                    bars = fallback
-            ind = compute_all(bars)
+            # (07.10) ВАЖНО: вече взимаме ДНЕВНИ (не 5-мин) свещи - двата
+            # валидирани сигнала (donchian_breakout/fib_retracement_bounce,
+            # виж strategies.py) са backtest-вани на дневни бари. yfinance е
+            # безплатен и не изисква ключ (виж data_sources.get_bars_yfinance).
+            # ЧЕСТНА бележка: докато пазарът е отворен, последният ("днешен")
+            # ред е още недовършена свещ - виж бележката в indicators.py.
+            bars = get_bars_yfinance(symbol, interval="1d", period="6mo", limit=150)
+            if len(bars) < _MIN_DAILY_BARS_FOR_SIGNALS:
+                continue
+            ind = compute_daily_signals(bars)
             if not ind or ind["price"] > config.MAX_UNIVERSE_PRICE:
                 continue
             catalyst = _has_news_catalyst(symbol, resumed_symbols)
@@ -473,6 +476,18 @@ def run_price_spike_scan():
 
     if fired:
         log.info("Ценови скок сканиране: сигнал за %s", fired)
+
+    # ВАЖНО (02.10, след реален "exceeded its memory limit" инцидент на
+    # Render - виж config.py/data_sources.py за пълния контекст): логваме
+    # текущата памет на процеса на всяка обиколка, за да личи в Render Logs
+    # дали расте с времето (ранен признак на memory leak), преди да стигне
+    # до следващ OOM restart.
+    try:
+        import resource
+        peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        log.info("Ценови скок: пикова памет на процеса засега ~%.0f MB.", peak_mb)
+    except Exception:
+        pass
 
 
 def _scan_loop():

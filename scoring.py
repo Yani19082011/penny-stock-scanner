@@ -1,25 +1,44 @@
 """
-Confluence score: комбинира техническите индикатори + news catalyst +
-dilution защита в едно число 0-100. Прагът за "висок потенциал" (~25%
-target) идва от backtest.py - тук е само формулата и разумни начални
-тегла, които backtest-ът трябва да калибрира с реални данни, преди да се
-разчита на тях за живи алърти.
+Confluence score: превръща дневните сигнали от indicators.compute_daily_signals
+(виж там за пълния контекст) в едно число 0-100, плюс dilution защита.
+
+ПРОМЯНА (07.10, по изрична молба "давай искам това да е главната стратегия
+махни старата"): старата версия тук сумираше точки от 7-8 intraday
+индикатора (EMA/VWAP/ORB/relative volume/bullish свещ/news catalyst/RSI) с
+тегла, които НИКОГА не бяха систематично backtest-вани. Сега, след 9 кръга
+строг backtest (виж strategy_backtest.py), имаме само 2 дневни сигнала с
+реално доказано, повтарящо се предимство: `donchian_breakout` (по-силния -
+хваща самия пробив на 20-дневен връх на обем) и `fib_retracement_bounce`
+(по-слабия - откат до 50-61.8% Fibonacci зона с отскок). Новата схема:
+
+  - donchian_breakout = True   -> score = 100  (над HIGH_POTENTIAL_THRESHOLD=70
+                                                 -> "ВИСОК ПОТЕНЦИАЛ" алърт)
+  - fib_retracement_bounce = True (и НЕ donchian) -> score = 55
+                                                 (над EXIT_THRESHOLD=40 ->
+                                                 остава в watchlist, НЕ алъртва)
+  - нито едното               -> score = 0     (излиза от watchlist)
+
+config.HIGH_POTENTIAL_THRESHOLD(70)/EXIT_THRESHOLD(40) НЕ са променяни -
+старите им стойности случайно се map-ват чисто на новата схема.
+
+ВАЖНО: news catalyst вече НЕ е твърдо условие за "ВИСОК ПОТЕНЦИАЛ" - нито
+donchian_breakout, нито fib_retracement_bounce са backtest-вани с
+news-catalyst филтър, затова добавянето му сега би било непроверено
+допълнително ограничение. Catalyst статус СЕ показва информативно в
+reasons (за твоя преценка в email-а), но вече не блокира алърта.
+
+ВАЖНО (запазено от 18.09 - виж историята на тази бележка): активен
+S-1/S-3/424B dilution filing ВСЕ ОЩЕ спира "ВИСОК ПОТЕНЦИАЛ" алърта твърдо,
+независимо от score-а - това е НЕЗАВИСИМО от коя техническа стратегия се
+ползва и защитава срещу реален документиран минал инцидент (TEAD).
 """
 from dataclasses import dataclass, field
-from typing import Optional
 
 import config
 
-WEIGHTS = {
-    "trend_up": 15,           # EMA9 > EMA20
-    "above_vwap": 10,
-    "orb_bullish": 20,        # пробив над opening range
-    "relative_volume": 20,    # скалирано според силата на обема (виж по-долу)
-    "bullish_candle": 10,
-    "news_catalyst": 15,      # има скорошна новина, свързана с движението
-    "rsi_not_overbought": 5,  # RSI < 75 -> все още има място за движение
-    "no_dilution_filing": 5,  # без скорошен S-1/S-3/424B filing
-}
+DONCHIAN_SCORE = 100.0
+FIB_RETRACEMENT_SCORE = 55.0
+NO_SIGNAL_SCORE = 0.0
 
 
 @dataclass
@@ -33,70 +52,40 @@ class ScoreResult:
 
     @property
     def is_high_potential(self) -> bool:
-        return self.score >= config.HIGH_POTENTIAL_THRESHOLD and self.has_catalyst and not self.has_dilution_risk
+        # (07.10) news catalyst вече не е твърдо условие - виж бележката
+        # по-горе. Dilution hard-gate е запазен непроменен.
+        return self.score >= config.HIGH_POTENTIAL_THRESHOLD and not self.has_dilution_risk
 
     @property
     def should_stay_in_watchlist(self) -> bool:
         return self.score >= config.EXIT_THRESHOLD
 
 
-def _relative_volume_points(rel_vol: Optional[float]) -> float:
-    if rel_vol is None or rel_vol != rel_vol:  # NaN check
-        return 0
-    if rel_vol >= 5:
-        return WEIGHTS["relative_volume"]
-    if rel_vol >= 3:
-        return WEIGHTS["relative_volume"] * 0.7
-    if rel_vol >= 2:
-        return WEIGHTS["relative_volume"] * 0.4
-    return 0
-
-
 def score_symbol(symbol: str, ind: dict, has_news_catalyst: bool, dilution_flags: dict) -> ScoreResult:
     if not ind:
         return ScoreResult(symbol=symbol, score=0, reasons=["недостатъчно данни"])
 
-    points = 0.0
     reasons = []
 
-    if ind.get("trend_up"):
-        points += WEIGHTS["trend_up"]
-        reasons.append("EMA9 > EMA20 (uptrend)")
-
-    if ind.get("above_vwap"):
-        points += WEIGHTS["above_vwap"]
-        reasons.append("цена над VWAP")
-
-    if ind.get("orb_breakout") == "bullish":
-        points += WEIGHTS["orb_bullish"]
-        reasons.append("opening-range breakout нагоре")
-
-    rv_points = _relative_volume_points(ind.get("relative_volume"))
-    if rv_points:
-        points += rv_points
-        reasons.append(f"relative volume x{ind.get('relative_volume'):.1f}")
-
-    if ind.get("bullish_candle"):
-        points += WEIGHTS["bullish_candle"]
-        reasons.append("силна bullish свещ")
+    if ind.get("donchian_breakout"):
+        score = DONCHIAN_SCORE
+        reasons.append("Donchian breakout: пробив над 20-дневен връх на обем (виж strategies.py)")
+    elif ind.get("fib_retracement_bounce"):
+        score = FIB_RETRACEMENT_SCORE
+        reasons.append("Fibonacci retracement bounce: откат в 50-61.8% зона с отскок (виж strategies.py)")
+    else:
+        score = NO_SIGNAL_SCORE
 
     if has_news_catalyst:
-        points += WEIGHTS["news_catalyst"]
-        reasons.append("скорошна новина/catalyst")
-
-    rsi14 = ind.get("rsi14")
-    if rsi14 is not None and rsi14 < 75:
-        points += WEIGHTS["rsi_not_overbought"]
+        reasons.append("(информативно) скорошна новина/catalyst - вече не се изисква за алърт")
 
     has_dilution_risk = bool(dilution_flags.get("has_recent_dilution_filing", False))
-    if not has_dilution_risk:
-        points += WEIGHTS["no_dilution_filing"]
-    else:
+    if has_dilution_risk:
         reasons.append("⚠️ скорошен dilution filing (S-1/S-3/424B) - твърдо спира 'ВИСОК ПОТЕНЦИАЛ' алърта (виж is_high_potential)")
 
     return ScoreResult(
         symbol=symbol,
-        score=round(points, 1),
+        score=score,
         reasons=reasons,
         has_catalyst=has_news_catalyst,
         has_dilution_risk=has_dilution_risk,
