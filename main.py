@@ -227,6 +227,14 @@ def _is_market_hours() -> bool:
 # виж indicators.py/scoring.py) - виж min_len проверките в strategies.py
 # (donchian: channel_period+25=45, fib_retracement: swing_lookback+2=42);
 # тук искаме малко буфер над това.
+#
+# (08.10) НЕ вдигнато допълнително, въпреки че near_high_volume_build
+# изисква 125 бара (най-строгото от новите 3 сигнала - виж indicators.py) -
+# нарочно: near_high_volume_build сама се пази вътрешно (strategies.py) и
+# просто връща False за тикери с по-къса история, вместо да филтрираме
+# ЦЕЛИЯ тикер от universe-а само защото ЕДИН от няколкото сигнала не може
+# да се смята за него. Затова важното е РЕАЛНИТЕ данни по-долу (period)
+# да стигат 125+ бара, когато тикерът действително ги има.
 _MIN_DAILY_BARS_FOR_SIGNALS = 90
 
 
@@ -242,7 +250,12 @@ def _score_symbols(symbols) -> list:
             # безплатен и не изисква ключ (виж data_sources.get_bars_yfinance).
             # ЧЕСТНА бележка: докато пазарът е отворен, последният ("днешен")
             # ред е още недовършена свещ - виж бележката в indicators.py.
-            bars = get_bars_yfinance(symbol, interval="1d", period="6mo", limit=150)
+            # (08.10) period вдигнат от "6mo" на "1y" и limit от 150 на 200 -
+            # near_high_volume_build (новия сигнал, виж indicators.py) изисква
+            # 125 бара история, а "6mo" (~126 търговски дни) е била твърде на
+            # ръба (всяка дупка/празник би я свалила под прага) - "1y" дава
+            # истински буфер.
+            bars = get_bars_yfinance(symbol, interval="1d", period="1y", limit=200)
             if len(bars) < _MIN_DAILY_BARS_FOR_SIGNALS:
                 continue
             ind = compute_daily_signals(bars)

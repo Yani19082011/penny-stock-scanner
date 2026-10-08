@@ -14,6 +14,25 @@ strategies.py, всяка тествана с random_baseline контрол И 
 Затова сега ботът използва ДИРЕКТНО тези две (непроменени) функции от
 strategies.py, вместо старите intraday индикатори.
 
+ПРОМЯНА (08.10, по изрична молба "айде да решим за бота оправи кода със
+новите стратегии" - след общо 24 кръга допълнителен backtest, виж пълната
+история в strategies.py): добавени ОЩЕ 3 сигнала, всеки 3-прозоречно (--
+offset-days 250 и 500, независими периоди) валидиран преди да влезе тук:
+  - `near_high_volume_build` - "преди пробива" сигнал (цена близо до
+    N-дневен връх, НЕ го е пробила, обемът се трупа). 3/3 прозореца:
+    max_loss драстично по-нисък от random, win_rate по-добър в 2/3.
+  - `volume_climax_reversal_2day` - паник-обем ден, потвърден на СЛЕДВАЩИЯ
+    ден без нов минимум. Най-стабилната находка в цялата сесия - caught_
+    20pct_spike по-висок от random в 3/3 прозореца без изключение.
+  - `momentum_acceleration` - ROC ускорява строго монотонно. Самостоятелно
+    слаб сигнал, но в комбинация с fib_retracement_bounce max_loss пада
+    значимо и стабилно 3/3 прозореца - затова се смята ТУК само като
+    ДОПЪЛНИТЕЛНА информация към fib сигнала (виж scoring.py), не като
+    самостоятелен критерий.
+Съзнателно НЕ added: `stealth_volume_anomaly` - 3-прозоречният тест излезе
+нестабилен (win_rate обърна посока 3 пъти, третият прозорец имаше само
+n=19 сигнала) - недостатъчно надеждно за живо приложение (08.10).
+
 ЧЕСТНА бележка за живо приложение: strategies.py функциите са backtest-вани
 на ЗАТВОРЕНИ дневни свещи (walk-forward, без lookahead - виж strategy_
 backtest.py). На живо, докато пазарът е отворен, "днешният" ред от
@@ -28,12 +47,16 @@ import strategies
 
 
 def compute_daily_signals(df) -> dict:
-    """Смята двата валидирани дневни сигнала за последния (най-пресен) ред
-    от df. Изисква достатъчно история и за двете стратегии - виж min_len
-    проверките в strategies.py (donchian: channel_period+25=45,
-    fib_retracement: swing_lookback+2=42) - тук искаме малко повече буфер,
-    за да сме сигурни, че индикаторите имат стабилна база (виж main.py
-    ::_MIN_DAILY_BARS_FOR_SIGNALS)."""
+    """Смята валидираните дневни сигнали за последния (най-пресен) ред от
+    df. Изисква достатъчно история - виж min_len проверките в strategies.py
+    (donchian: channel_period+25=45, fib_retracement: swing_lookback+2=42,
+    momentum_acceleration: 5+3+20=28, volume_climax_reversal_2day:
+    20+25+2=47, near_high_volume_build: 60+65=125 - НАЙ-строгото изискване).
+    Външната проверка тук е по-рехава (45) умишлено - near_high_volume_build
+    сама се пази вътрешно и просто връща False за тикери с по-къса история
+    (виж main.py::_score_symbols за реалния период данни, който се тегли -
+    вдигнат на "1y", за да има достатъчно бари за near_high_volume_build,
+    когато тикерът реално има толкова дълга история)."""
     if df is None or df.empty or len(df) < 45:
         return {}
 
@@ -45,4 +68,7 @@ def compute_daily_signals(df) -> dict:
         "price": float(last_close),
         "donchian_breakout": bool(strategies.signal_donchian_breakout(df)),
         "fib_retracement_bounce": bool(strategies.signal_fib_retracement_bounce(df)),
+        "momentum_acceleration": bool(strategies.signal_momentum_acceleration(df)),
+        "near_high_volume_build": bool(strategies.signal_near_high_volume_build(df)),
+        "volume_climax_reversal_2day": bool(strategies.signal_volume_climax_reversal_2day(df)),
     }
