@@ -332,72 +332,100 @@ def _maybe_alert_high_potential(symbol: str, meta: dict, result):
 
 
 def run_fast_check():
-    """Бърз цикъл - само текущия watchlist, за реално-времеви алърти."""
+    """Бърз цикъл - само текущия watchlist, за реално-времеви алърти.
+
+    ВАЖНО (09.10, по реален инцидент - "40 минути няма нищо" в Render
+    логовете, виж _scan_loop по-долу за пълния контекст): цялото тяло
+    сега е в try/except. ПРЕДИ тази промяна, необработено изключение ТУК
+    щеше да убие цялата фонова нишка завинаги (до следващ redeploy/restart)
+    - self-ping нишката и Flask health-check щяха да продължат да отговарят
+    нормално, създавайки измамно впечатление, че ботът работи, докато
+    реално НИКОГА повече няма да сканира."""
     if not _is_market_hours():
         return
-    current_watchlist = load_watchlist()
-    if not current_watchlist:
-        return
+    try:
+        current_watchlist = load_watchlist()
+        if not current_watchlist:
+            return
 
-    scores = _score_symbols(current_watchlist.keys())
-    scores_by_symbol = {s.symbol: s for s in scores}
+        scores = _score_symbols(current_watchlist.keys())
+        scores_by_symbol = {s.symbol: s for s in scores}
 
-    for symbol, meta in current_watchlist.items():
-        result = scores_by_symbol.get(symbol)
-        if result:
-            meta["last_score"] = result.score
-        _maybe_alert_high_potential(symbol, meta, result)
+        for symbol, meta in current_watchlist.items():
+            result = scores_by_symbol.get(symbol)
+            if result:
+                meta["last_score"] = result.score
+            _maybe_alert_high_potential(symbol, meta, result)
 
-    save_watchlist(current_watchlist)
-    _status["last_fast_check_at"] = datetime.now(timezone.utc).isoformat()
-    _status["last_watchlist"] = current_watchlist
-    log.info("Бърз цикъл: %s", {s: m.get("last_score") for s, m in current_watchlist.items()})
+        save_watchlist(current_watchlist)
+        _status["last_fast_check_at"] = datetime.now(timezone.utc).isoformat()
+        _status["last_watchlist"] = current_watchlist
+        log.info("Бърз цикъл: %s", {s: m.get("last_score") for s, m in current_watchlist.items()})
+    except Exception as e:
+        log.error(
+            "Бързият цикъл се провали с необработена грешка (хваната - фоновата нишка ПРОДЪЛЖАВА да "
+            "работи, следващият цикъл по разписание ще опита пак): %s", e, exc_info=True,
+        )
 
 
 def run_full_scan():
-    """Пълно сканиране - целия universe, за нови кандидати + watchlist ротация."""
+    """Пълно сканиране - целия universe, за нови кандидати + watchlist ротация.
+
+    ВАЖНО (09.10, виж бележката в run_fast_check/_scan_loop за пълния
+    контекст): цялото тяло (без early-return проверката за пазарни часове)
+    сега е в try/except по същата причина - необработено изключение тук
+    преди НЕ просто пропускаше едно сканиране, а убиваше фоновата нишка
+    ЗАВИНАГИ, без видима грешка в Render-овия health-check (self-ping
+    продължава да отговаря 200 OK, защото е в отделна нишка - виж
+    _self_ping_loop)."""
     if not _is_market_hours():
         log.info("Извън пазарни часове - пропускам пълното сканиране.")
         return
 
-    log.info("Стартирам пълно сканиране...")
-    current_watchlist = load_watchlist()
-    universe = set(get_universe()) | set(current_watchlist.keys())
+    try:
+        log.info("Стартирам пълно сканиране...")
+        current_watchlist = load_watchlist()
+        universe = set(get_universe()) | set(current_watchlist.keys())
 
-    all_scores = _score_symbols(universe)
-    new_watchlist, added, dropped = update_watchlist(current_watchlist, all_scores)
+        all_scores = _score_symbols(universe)
+        new_watchlist, added, dropped = update_watchlist(current_watchlist, all_scores)
 
-    scores_by_symbol = {s.symbol: s for s in all_scores}
-    for symbol in added:
-        # ВАЖНО (18.09, намерено при цялостен преглед на кода): по-рано тук
-        # директно се пращаше email при ВСЯКО влизане в watchlist - но
-        # влизането изисква само score >= EXIT_THRESHOLD (40/100) на ЕДНО-
-        # ЕДИНСТВЕНО сканиране, без потвърждение и без drawdown проверка -
-        # точно същият клас бъг ("алърт на единичен spike"), който вече
-        # оправихме за "ВИСОК ПОТЕНЦИАЛ" алъртите (виж
-        # MIN_HIGH_POTENTIAL_CONFIRMATIONS/PEAK_DRAWDOWN_STOP_PCT по-долу).
-        # Влизането в watchlist само по себе си вече НЕ праща email - само
-        # лог за проследяване. Реален email идва единствено през
-        # _maybe_alert_high_potential(), което изисква истинско потвърждение.
+        scores_by_symbol = {s.symbol: s for s in all_scores}
+        for symbol in added:
+            # ВАЖНО (18.09, намерено при цялостен преглед на кода): по-рано тук
+            # директно се пращаше email при ВСЯКО влизане в watchlist - но
+            # влизането изисква само score >= EXIT_THRESHOLD (40/100) на ЕДНО-
+            # ЕДИНСТВЕНО сканиране, без потвърждение и без drawdown проверка -
+            # точно същият клас бъг ("алърт на единичен spike"), който вече
+            # оправихме за "ВИСОК ПОТЕНЦИАЛ" алъртите (виж
+            # MIN_HIGH_POTENTIAL_CONFIRMATIONS/PEAK_DRAWDOWN_STOP_PCT по-долу).
+            # Влизането в watchlist само по себе си вече НЕ праща email - само
+            # лог за проследяване. Реален email идва единствено през
+            # _maybe_alert_high_potential(), което изисква истинско потвърждение.
+            log.info(
+                "%s влиза в watchlist (score=%.1f) - следя го, но НЯМА да пратя email, докато не се "
+                "потвърди (виж MIN_HIGH_POTENTIAL_CONFIRMATIONS/PEAK_DRAWDOWN_STOP_PCT).",
+                symbol, scores_by_symbol[symbol].score,
+            )
+        for symbol in dropped:
+            log.info("%s излиза от watchlist (score падна под прага).", symbol)
+
+        for symbol, meta in new_watchlist.items():
+            _maybe_alert_high_potential(symbol, meta, scores_by_symbol.get(symbol))
+
+        save_watchlist(new_watchlist)
+        _status["last_full_scan_at"] = datetime.now(timezone.utc).isoformat()
+        _status["last_watchlist"] = new_watchlist
+
         log.info(
-            "%s влиза в watchlist (score=%.1f) - следя го, но НЯМА да пратя email, докато не се "
-            "потвърди (виж MIN_HIGH_POTENTIAL_CONFIRMATIONS/PEAK_DRAWDOWN_STOP_PCT).",
-            symbol, scores_by_symbol[symbol].score,
+            "Пълно сканиране завършено. Watchlist (%d/%d): %s",
+            len(new_watchlist), config.WATCHLIST_SIZE, list(new_watchlist.keys()),
         )
-    for symbol in dropped:
-        log.info("%s излиза от watchlist (score падна под прага).", symbol)
-
-    for symbol, meta in new_watchlist.items():
-        _maybe_alert_high_potential(symbol, meta, scores_by_symbol.get(symbol))
-
-    save_watchlist(new_watchlist)
-    _status["last_full_scan_at"] = datetime.now(timezone.utc).isoformat()
-    _status["last_watchlist"] = new_watchlist
-
-    log.info(
-        "Пълно сканиране завършено. Watchlist (%d/%d): %s",
-        len(new_watchlist), config.WATCHLIST_SIZE, list(new_watchlist.keys()),
-    )
+    except Exception as e:
+        log.error(
+            "Пълното сканиране се провали с необработена грешка (хваната - фоновата нишка "
+            "ПРОДЪЛЖАВА да работи, следващото сканиране по разписание ще опита пак): %s", e, exc_info=True,
+        )
 
 
 # --- "ЦЕНОВИ СКОК" v2 - виж config.PRICE_SPIKE_* и notifier.send_price_spike_alert
@@ -517,8 +545,25 @@ def _scan_loop():
     schedule.every(config.FAST_INTERVAL_MINUTES).minutes.do(run_fast_check)
     schedule.every(config.PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES).minutes.do(run_price_spike_universe_refresh)
     schedule.every(config.PRICE_SPIKE_INTERVAL_MINUTES).minutes.do(run_price_spike_scan)
+    # ВАЖНО (09.10, по реален инцидент - потребителят съобщи "40 минути
+    # няма нищо" в логовете И 0 изпратени сигнала за целия ден): открихме,
+    # че необработено изключение във ВСЯКА от 4-те schedule-нати функции
+    # по-горе убиваше ЦЯЛАТА фонова нишка ЗАВИНАГИ (daemon thread, никой
+    # не я рестартира) - докато Flask health-check + self-ping нишката
+    # (виж _self_ping_loop) продължаваха да отговарят 200 OK нормално,
+    # създавайки измамно впечатление за здрав бот. Сега run_full_scan/
+    # run_fast_check имат собствен try/except (виж там), но добавяме и
+    # тази "защита в дълбочина" тук - дори ако нещо НЕПРЕДВИДЕНО все пак
+    # прескочи през тях (напр. бъдеща нова schedule-ната функция без
+    # собствен try/except), цикълът продължава, вместо да умре тихо.
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            log.error(
+                "Необработена грешка в schedule.run_pending() (хваната - фоновата нишка "
+                "ПРОДЪЛЖАВА да работи): %s", e, exc_info=True,
+            )
         time.sleep(15)
 
 
