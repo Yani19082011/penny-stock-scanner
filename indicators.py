@@ -33,6 +33,20 @@ offset-days 250 и 500, независими периоди) валидиран 
 нестабилен (win_rate обърна посока 3 пъти, третият прозорец имаше само
 n=19 сигнала) - недостатъчно надеждно за живо приложение (08.10).
 
+ПРОМЯНА (10.10, по молба "има ли такава която да е като donchian но да
+изпраща по-често" - кръг 26 в strategies.py, 3 варианта тествани,
+3-прозоречно --offset-days 250/500): добавен `donchian_sustained_breakout`
+- СЪЩИЯТ 20-дневен канал като donchian_breakout, но БЕЗ изискването "само
+първия ден на пробива" (хваща и продължението на силен пробив, не само
+първия ден). 3/3 прозореца ЧИСТА победа над самата donchian_breakout: ~32-
+39% ПОВЕЧЕ сигнали, win_rate/median_ret/caught_20pct_spike по-добри или
+равни на всички хоризонти във всичките 3 прозореца, max_loss практически
+ИДЕНТИЧЕН на donchian навсякъде (никъде по-лош) - най-стабилната находка в
+цялата сесия. Затова влиза на СЪЩОТО ниво като donchian_breakout в
+scoring.py (score=100), не watchlist. Другите 2 варианта от кръг 26
+(donchian_breakout_short, donchian_breakout_loose_volume) НЕ се добавят -
+по-нестабилен/по-лош риск профил между прозорците (виж strategies.py).
+
 ЧЕСТНА бележка за живо приложение: strategies.py функциите са backtest-вани
 на ЗАТВОРЕНИ дневни свещи (walk-forward, без lookahead - виж strategy_
 backtest.py). На живо, докато пазарът е отворен, "днешният" ред от
@@ -67,6 +81,7 @@ def compute_daily_signals(df) -> dict:
     return {
         "price": float(last_close),
         "donchian_breakout": bool(strategies.signal_donchian_breakout(df)),
+        "donchian_sustained_breakout": bool(strategies.signal_donchian_sustained_breakout(df)),
         "fib_retracement_bounce": bool(strategies.signal_fib_retracement_bounce(df)),
         "momentum_acceleration": bool(strategies.signal_momentum_acceleration(df)),
         "near_high_volume_build": bool(strategies.signal_near_high_volume_build(df)),

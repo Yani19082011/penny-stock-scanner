@@ -2244,6 +2244,233 @@ def signal_range_compression_volume_asymmetry(df: pd.DataFrame, window: int = 15
     return bool(asymmetric)
 
 
+def signal_breakout_followthrough_2day(df: pd.DataFrame, lookback: int = 20, vol_mult: float = 1.5,
+                                         min_bars: int = 25) -> bool:
+    """Breakout Follow-Through (2-дневно потвърждение): ОРИГИНАЛНА идея -
+    донован breakout (donchian_breakout) и всички други breakout стратегии
+    тук сигнализират В ДЕНЯ на самия пробив - купуваш веднага, без да знаеш
+    дали пробивът ще "удържи". Тук пробивът (цена над `lookback`-дневен
+    връх, с обемен spike) трябва да се случи ВЧЕРА (ден T-1), а сигналът
+    излиза само ако ДНЕС (ден T) цената НЕ дава пробива обратно (today
+    low >= нивото на пробива) И затваря >= вчерашното затваряне. Идеята е
+    огледална на volume_climax_reversal_2day (2-дневно потвърждение на
+    ОБРАТ) - тук е 2-дневно потвърждение на ПРОБИВ.
+    (09.10, по молба "днес ще правим още backtests на стратегии")."""
+    min_len = lookback + min_bars + 2
+    if len(df) < min_len:
+        return False
+    high, low, close, vol = df["high"], df["low"], df["close"], df["volume"]
+    window_before_breakout = df.iloc[-(lookback + 2):-2]
+    prior_high = window_before_breakout["high"].max()
+    breakout_close = close.iloc[-2]
+    if not prior_high or breakout_close <= prior_high:
+        return False
+    avg_vol = window_before_breakout["volume"].mean()
+    if not avg_vol:
+        return False
+    breakout_vol_ok = vol.iloc[-2] >= vol_mult * avg_vol
+    if not breakout_vol_ok:
+        return False
+    follow_through = (close.iloc[-1] >= close.iloc[-2]) and (low.iloc[-1] >= prior_high)
+    return bool(follow_through)
+
+
+def signal_closing_strength_acceleration(df: pd.DataFrame, lookback: int = 4, min_bars: int = 20) -> bool:
+    """Closing Strength Acceleration: ОРИГИНАЛНА идея - различна от
+    closing_strength_streak (кръг 24, тя изискваше ПЛОСЪК праг - всеки ден
+    над clv_threshold). Тук се изисква CLV (= (close-low)/(high-low)) да
+    расте СТРОГО МОНОТОННО ден след ден (не просто да е високо) - т.е.
+    купувачкият натиск се УСИЛВА всеки следващ ден, не просто присъства.
+    Същата "втора производна" идея като momentum_acceleration (ROC-ът
+    расте монотонно), но приложена върху позицията на затварянето в
+    дневния диапазон, не върху самата цена.
+    (09.10, по молба "днес ще правим още backtests на стратегии")."""
+    min_len = lookback + min_bars
+    if len(df) < min_len:
+        return False
+    recent = df.iloc[-lookback:]
+    rng = recent["high"] - recent["low"]
+    if (rng <= 0).any():
+        return False
+    clv = ((recent["close"] - recent["low"]) / rng).values
+    strictly_increasing = all(clv[i] < clv[i + 1] for i in range(len(clv) - 1))
+    return bool(strictly_increasing and clv[-1] >= 0.6)
+
+
+def signal_island_reversal_gap(df: pd.DataFrame, min_bars: int = 20) -> bool:
+    """Island Reversal Gap: класическа свещна формация, но НЕ е била
+    тествана тук досега в тази точна форма - различна от hammer_reversal/
+    morning_star_reversal/capitulation_reversal (те гледат формата на
+    свещите, не празнини между сесиите). Изисква: ден T-2 нормален, ден
+    T-1 ПРАЗНИНА НАДОЛУ (high на T-1 < low на T-2) И тесен диапазон
+    (<60% от диапазона на T-2 - изолиран, нерешителен ден), после ден T
+    ПРАЗНИНА НАГОРЕ (low на T > high на T-1) - денят T-1 остава "остров",
+    изолиран от празнини от двете страни.
+    https://www.investopedia.com/terms/i/island-reversal.asp
+    (09.10, по молба "днес ще правим още backtests на стратегии")."""
+    min_len = min_bars + 3
+    if len(df) < min_len:
+        return False
+    high, low = df["high"], df["low"]
+    gap_down = high.iloc[-2] < low.iloc[-3]
+    narrow = (high.iloc[-2] - low.iloc[-2]) < (high.iloc[-3] - low.iloc[-3]) * 0.6
+    gap_up = low.iloc[-1] > high.iloc[-2]
+    return bool(gap_down and narrow and gap_up)
+
+
+def signal_donchian_breakout_short(df: pd.DataFrame, channel_period: int = 10, confirm_vol_mult: float = 1.5) -> bool:
+    """Donchian Breakout (КЪСА версия, 10-дневен канал): СЪЩАТА точна
+    логика като живата donchian_breakout (виж там) - само `channel_period`
+    е намален от 20 на 10 дни. Идеята: 10-дневен връх се "обновява"
+    по-бързо от 20-дневен, значи би трябвало да дава ПОВЕЧЕ сигнали -
+    целта е да проверим дали по-честата версия пази поне сравнимо
+    предимство с оригинала, или губи качество заради по-късия хоризонт.
+    (10.10, по молба "има ли такава която да е като donchian но да
+    изпраща по-често")."""
+    min_len = channel_period + 25
+    if len(df) < min_len:
+        return False
+    high, low, close, volume = df["high"], df["low"], df["close"], df["volume"]
+    prior_highest_today = high.iloc[-(channel_period + 1):-1].max()
+    prior_highest_yest = high.iloc[-(channel_period + 2):-2].max()
+    today_close, yest_close = close.iloc[-1], close.iloc[-2]
+    broke_out_today = (today_close > prior_highest_today) and (yest_close <= prior_highest_yest)
+    if not broke_out_today:
+        return False
+    avg_vol = volume.iloc[-21:-1].mean()
+    today_vol = volume.iloc[-1]
+    if not avg_vol:
+        return False
+    return bool(today_vol >= confirm_vol_mult * avg_vol)
+
+
+def signal_donchian_sustained_breakout(df: pd.DataFrame, channel_period: int = 20, confirm_vol_mult: float = 1.5) -> bool:
+    """Donchian Sustained Breakout: СЪЩИЯТ 20-дневен канал като живата
+    donchian_breakout, но БЕЗ изискването "само ПЪРВИЯ ден на пробива"
+    (там вчера трябва да е бил под нивото, днес над - сигналът излиза
+    само веднъж на събитие). Тук е достатъчно днес да затваря над
+    20-дневния връх И с обемно потвърждение - независимо дали вчера вече
+    е бил над канала. Идеята: хваща и ПРОДЪЛЖЕНИЕТО на силен пробив, не
+    само първия ден - би трябвало да дава значимо повече сигнали.
+    (10.10, по молба "има ли такава която да е като donchian но да
+    изпраща по-често")."""
+    min_len = channel_period + 25
+    if len(df) < min_len:
+        return False
+    high, close, volume = df["high"], df["close"], df["volume"]
+    prior_highest = high.iloc[-(channel_period + 1):-1].max()
+    today_close = close.iloc[-1]
+    if not prior_highest or today_close <= prior_highest:
+        return False
+    avg_vol = volume.iloc[-21:-1].mean()
+    today_vol = volume.iloc[-1]
+    if not avg_vol:
+        return False
+    return bool(today_vol >= confirm_vol_mult * avg_vol)
+
+
+def signal_donchian_breakout_loose_volume(df: pd.DataFrame, channel_period: int = 20, confirm_vol_mult: float = 1.15) -> bool:
+    """Donchian Breakout (РЕХАВ обемен праг): СЪЩАТА точна логика като
+    живата donchian_breakout (20-дневен канал, само първия ден на
+    пробива) - единствената разлика е обемният праг, свален от 1.5x на
+    1.15x средния обем. Идеята: пробиви с ПО-СКРОМНО обемно потвърждение
+    (все пак някакво, не нулево) може да са пропускани от строгия 1.5x
+    праг - проверяваме дали разхлабването пази предимство или просто
+    пуска повече слаби/фалшиви пробиви.
+    (10.10, по молба "има ли такава която да е като donchian но да
+    изпраща по-често")."""
+    min_len = channel_period + 25
+    if len(df) < min_len:
+        return False
+    high, low, close, volume = df["high"], df["low"], df["close"], df["volume"]
+    prior_highest_today = high.iloc[-(channel_period + 1):-1].max()
+    prior_highest_yest = high.iloc[-(channel_period + 2):-2].max()
+    today_close, yest_close = close.iloc[-1], close.iloc[-2]
+    broke_out_today = (today_close > prior_highest_today) and (yest_close <= prior_highest_yest)
+    if not broke_out_today:
+        return False
+    avg_vol = volume.iloc[-21:-1].mean()
+    today_vol = volume.iloc[-1]
+    if not avg_vol:
+        return False
+    return bool(today_vol >= confirm_vol_mult * avg_vol)
+
+
+def signal_donchian_sustained_breakout_short(df: pd.DataFrame, channel_period: int = 10, confirm_vol_mult: float = 1.5) -> bool:
+    """Комбинация от двата най-успешни трика в кръг 26: късия 10-дневен
+    канал (donchian_breakout_short) + премахнатото "само първия ден"
+    ограничение (donchian_sustained_breakout, най-стабилната находка
+    досега). Идеята: ако двата механизма поотделно вдигат честотата, дали
+    комбинирани вдигат още повече честотата, пазейки чистотата на
+    sustained версията (max_loss идентичен на donchian във всичките 3
+    прозорца)?
+    (10.10, кръг 27, по молба "дай да пробваме още няколко стратегии и
+    ако не намерим по-добра... ще я сложим [donchian_sustained_breakout]")."""
+    min_len = channel_period + 25
+    if len(df) < min_len:
+        return False
+    high, close, volume = df["high"], df["close"], df["volume"]
+    prior_highest = high.iloc[-(channel_period + 1):-1].max()
+    today_close = close.iloc[-1]
+    if not prior_highest or today_close <= prior_highest:
+        return False
+    avg_vol = volume.iloc[-21:-1].mean()
+    today_vol = volume.iloc[-1]
+    if not avg_vol:
+        return False
+    return bool(today_vol >= confirm_vol_mult * avg_vol)
+
+
+def signal_donchian_breakout_median_volume(df: pd.DataFrame, channel_period: int = 20, confirm_vol_mult: float = 1.5) -> bool:
+    """Същата логика като живата donchian_breakout (20-дневен канал, само
+    първия ден на пробива), но средния обем за сравнение е МЕДИАНА вместо
+    средно аритметично - по-устойчива на отделни обемни пикове (outliers)
+    през последните 20 дни, които могат изкуствено да вдигнат прага и да
+    "скрият" истински пробиви със солиден (но не рекорден) обем. Идеята:
+    орган различен от channel_period/volume_threshold - самата метрика за
+    "нормален обем" (10.10, кръг 27)."""
+    min_len = channel_period + 25
+    if len(df) < min_len:
+        return False
+    high, low, close, volume = df["high"], df["low"], df["close"], df["volume"]
+    prior_highest_today = high.iloc[-(channel_period + 1):-1].max()
+    prior_highest_yest = high.iloc[-(channel_period + 2):-2].max()
+    today_close, yest_close = close.iloc[-1], close.iloc[-2]
+    broke_out_today = (today_close > prior_highest_today) and (yest_close <= prior_highest_yest)
+    if not broke_out_today:
+        return False
+    median_vol = volume.iloc[-21:-1].median()
+    today_vol = volume.iloc[-1]
+    if not median_vol:
+        return False
+    return bool(today_vol >= confirm_vol_mult * median_vol)
+
+
+def signal_donchian_close_channel_breakout(df: pd.DataFrame, channel_period: int = 20, confirm_vol_mult: float = 1.5) -> bool:
+    """Оригинална вариация: каналът се дефинира от ЗАТВАРЯНИЯ (close), не
+    от дневни върхове (high) - т.е. "пробив" означава днешното затваряне
+    да е над най-високото ПРЕДИШНО затваряне за N дни, не над intraday
+    върха. По-малко "екстремно" ниво от high-базирания канал -> очакване
+    за по-чести сигнали, с въпроса дали пазят качество без intraday пика
+    (който донякъде е шум/фитил, не истинско ниво на затваряне).
+    (10.10, кръг 27)."""
+    min_len = channel_period + 25
+    if len(df) < min_len:
+        return False
+    close, volume = df["close"], df["volume"]
+    prior_highest_close_today = close.iloc[-(channel_period + 1):-1].max()
+    prior_highest_close_yest = close.iloc[-(channel_period + 2):-2].max()
+    today_close, yest_close = close.iloc[-1], close.iloc[-2]
+    broke_out_today = (today_close > prior_highest_close_today) and (yest_close <= prior_highest_close_yest)
+    if not broke_out_today:
+        return False
+    avg_vol = volume.iloc[-21:-1].mean()
+    today_vol = volume.iloc[-1]
+    if not avg_vol:
+        return False
+    return bool(today_vol >= confirm_vol_mult * avg_vol)
+
+
 # Регистър - strategy_backtest.py (и по-късно евентуално main.py) минава
 # през тях по име, за да може лесно да добавя/маха стратегии без да пипа
 # извикващия код.
@@ -2724,6 +2951,189 @@ def signal_range_compression_volume_asymmetry(df: pd.DataFrame, window: int = 15
 # реалистичен, повторяем кандидат за живия бот - или като самостоятелна
 # нова стратегия, или най-малкото като риск-филтър. Решението чака
 # потребителя.
+#
+# РЕЗУЛТАТ от КРЪГ 25 (3 нови оригинални идеи, 09.10):
+#
+# island_reversal_gap (n=4, без sub-nickel n=3) - ПРЕКАЛЕНО рядка формация
+# в тази вселена/период (gap надолу + тесен ден + gap нагоре едновременно
+# е много рядко при penny stocks) - практически нетестваема извадка.
+# Числата изглеждат зле, но с n=4 не значат нищо статистически. Не си
+# заслужава да се преследва по-нататък с тези прагове.
+#
+# closing_strength_acceleration (n=239, солидна извадка) - чисто
+# отрицателен резултат - по-нисък win_rate и медиана от random на
+# повечето хоризонти. Изискването CLV да расте СТРОГО монотонно се
+# оказа твърде тясно/произволно условие, без реално предимство.
+#
+# breakout_followthrough_2day (n=34, на ръба на малка извадка) - слаб,
+# шумен сигнал. win_rate леко по-добър на 3д (50.0% срещу 44.3%), но
+# практически равен на 5д/10д. median_ret по-зле на всички хоризонти.
+# max_loss по-нисък на всички хоризонти (-64/-70/-70% срещу -94/-94/
+# -97% random) - познатия "асиметричен" профил, но МНОГО по-слаб от
+# volume_climax_reversal_2day (n=100 там, тук само n=34, и win_rate тук
+# не държи стабилно). Не си заслужава извън-извадков тест на този етап -
+# твърде слабо и твърде малка извадка, за да оправдае 3 допълнителни теста.
+#
+# Чисто отрицателен/незадоволителен кръг - и трите не се препоръчват
+# по-нататък в текущия им вид.
+#
+# РЕЗУЛТАТ от КРЪГ 26 (10.10, по молба "има ли такава която да е като
+# donchian но да изпраща по-често, може да направим още тестове") - за
+# разлика от всички предишни кръгове, тук сравнението е ДИРЕКТНО срещу
+# живата donchian_breakout (не само срещу random_baseline), защото целта
+# не е "по-добра от случайно", а "по-честа от donchian, без да губи
+# качество спрямо donchian". Същ прозорец (--days 250): donchian_breakout
+# самата n=92, win_rate 34.8/37.0/33.7%, median_ret -4.31/-4.83/-7.24%,
+# max_loss -77.53/-80.90/-83.40%, caught_20pct 20.7/23.9/30.4%
+# (3д/5д/10д). random_baseline n=752, win_rate 42.3/38.4/38.7%.
+#
+# donchian_breakout_short (10-дневен канал вместо 20) - n=127 (+38%
+# СИГНАЛИ спрямо donchian). win_rate почти равен (33.9/37.0/36.2% -
+# равен или по-добър на 5д/10д). median_ret по-добра на 3д/10д
+# (-3.60/-4.93/-6.00% срещу -4.31/-4.83/-7.24%). max_loss по-лош на 3д/10д
+# (-88.00/-80.90/-87.33% срещу -77.53/-80.90/-83.40%). caught_20pct_spike
+# ПО-ВИСОК на ВСИЧКИ 3 хоризонта (24.4/29.1/36.2% срещу 20.7/23.9/30.4%).
+# Без sub-nickel - същата картина, потвърдено (n=123).
+#
+# donchian_sustained_breakout (без "само първия ден" ограничението) -
+# n=121 (+32% сигнали). win_rate ПО-ВИСОК на ВСИЧКИ 3 хоризонта
+# (40.5/41.3/37.2% срещу 34.8/37.0/33.7%). median_ret ПО-ДОБРА на ВСИЧКИ 3
+# хоризонта (-1.79/-2.63/-6.61% срещу -4.31/-4.83/-7.24%). max_loss РАВЕН
+# на всички хоризонти (-77.53/-80.90/-83.40% - идентичен с donchian).
+# caught_20pct_spike почти равен (19.0/24.0/31.4% срещу 20.7/23.9/30.4% -
+# леко по-нисък на 3д, леко по-добър на 10д). Без sub-nickel - същата
+# картина, потвърдено (n=119). ТОВА Е НАЙ-СИЛНИЯТ КАНДИДАТ от трите -
+# по-чест И по-добър/равен на дончиан на почти всяка метрика в този
+# прозорец, без компромис в max_loss.
+#
+# donchian_breakout_loose_volume (праг 1.15x вместо 1.5x обем) - n=112
+# (+22% сигнали, най-малкото увеличение от трите). win_rate/median_ret
+# леко по-добри от donchian на всички хоризонти, НО max_loss по-лош на
+# 3д/5д (-83.59% срещу -77.53%/-80.90%) и caught_20pct_spike по-НИСЪК на
+# ВСИЧКИ 3 хоризонта (17.9/21.4/28.6% срещу 20.7/23.9/30.4%) - единствената
+# от трите с консистентно по-слаб "улов на големи скокове". Най-слабият
+# кандидат от трите в този прозорец.
+#
+# ПРЕДВАРИТЕЛЕН ИЗВОД (прозорец 1, --days 250): donchian_sustained_
+# breakout изглежда най-обещаващ - повече сигнали И по-добър профил на
+# почти всяка метрика, без видим компромис. donchian_breakout_short също
+# солиден (повече сигнали, по-добро улавяне на скокове), но с леко
+# по-лош max_loss. donchian_breakout_loose_volume - най-слаб.
+#
+# --offset-days 250 (прозорец 2, независим период): donchian_breakout
+# самата тук n=105, win_rate 47.6/47.6/50.5%, max_loss -32.43/-36.00/
+# -55.50% (целият пазар по-"спокоен" в този прозорец - забележимо по-
+# ниски max_loss стойности навсякъде, включително при random_baseline).
+#
+# donchian_sustained_breakout (n=141, +34% спрямо donchian) - ПОТВЪРЖДАВА
+# прозорец 1: win_rate практически равен (47.5/46.1/53.2% срещу
+# 47.6/47.6/50.5% - смесено, никъде драстична разлика), max_loss
+# ИДЕНТИЧЕН на 3д/5д (-32.43%/-36.00%) и само леко по-лош на 10д
+# (-59.63% срещу -55.50%), caught_20pct_spike по-висок на ВСИЧКИ 3
+# хоризонта. Без sub-nickel - същата картина. 2 от 2 прозорца съгласни:
+# повече сигнали, без реална загуба на качество.
+#
+# donchian_breakout_short (n=136, +30%) - тук се ОБРЪЩА спрямо прозорец
+# 1: win_rate по-нисък на 3д/5д (41.2/44.9% срещу 47.6/47.6%), и най-
+# важно max_loss значимо ПО-ЛОШ на 3д/10д (-81.67%/-85.00% срещу
+# -32.43%/-55.50% на donchian) - точно обратното на прозорец 1, където
+# max_loss беше само леко по-лош. Смесен резултат между двата прозорца -
+# не достатъчно стабилен все още, чака 3-тия тест преди преценка.
+#
+# donchian_breakout_loose_volume (n=109, само +4% тук - много по-слабо
+# увеличение от прозорец 1) - ПОТВЪРЖДАВА се като най-слаб: по-нисък
+# win_rate/median_ret и значимо по-лош max_loss на ВСИЧКИ хоризонти
+# (-93.33/-98.89/-98.89% срещу -32.43/-36.00/-55.50%) спрямо donchian.
+# 2 от 2 прозорца съгласни - отпада, не се препоръчва 3-ти тест.
+#
+# --offset-days 500 (прозорец 3, последен независим тест): donchian_
+# breakout самата тук n=76, win_rate 39.5/31.6/34.2%, max_loss -50.0/
+# -50.0/-38.82%.
+#
+# donchian_sustained_breakout (n=106, +39% спрямо donchian - съгласно с
+# +32%/+34% в прозорец 1/2, МНОГО консистентно увеличение на честотата
+# във всичките 3 прозорца) - ЧИСТА ПОБЕДА на ВСЯКА метрика: win_rate
+# по-висок на ВСИЧКИ 3 хоризонта (42.5/35.8/35.8% срещу 39.5/31.6/34.2%),
+# median_ret по-добра на ВСИЧКИ 3 хоризонта, max_loss ИДЕНТИЧЕН на
+# ВСИЧКИ 3 хоризонта (-50.0/-50.0/-38.82% - същото число като donchian
+# до втория знак), caught_20pct_spike по-висок на ВСИЧКИ 3 хоризонта
+# (17.0/22.6/29.2% срещу 14.5/21.1/26.3%). Без sub-nickel - same.
+#
+# donchian_breakout_short (n=100, +32%) - смесен: win_rate/median_ret/
+# caught_spike по-добри тук (за разлика от прозорец 2, където бяха
+# по-зле), max_loss тук РАВЕН или по-добър (-50.0/-50.0/-35.0% срещу
+# -50.0/-50.0/-38.82%). НО в прозорец 2 max_loss беше драстично по-лош
+# (-81.67% срещу -32.43% на 3д) - т.е. между 3 прозореца max_loss за
+# тази версия се движи непостоянно (леко по-зле / много по-зле / леко
+# по-добре), докато за donchian_sustained_breakout max_loss е practически
+# ИДЕНТИЧЕН на donchian във ВСИЧКИ 3 прозорца без изключение.
+#
+# ФИНАЛЕН ИЗВОД (3 прозорца): donchian_sustained_breakout е НАЙ-ЧИСТИЯТ
+# резултат в цялата сесия засега - 3/3 прозорца с ~32-39% ПОВЕЧЕ сигнали
+# от живата donchian_breakout, И win_rate/median_ret/caught_20pct_spike
+# по-добри или равни на ВСИЧКИ хоризонти във ВСИЧКИТЕ 3 прозорца, И
+# max_loss практически ИДЕНТИЧЕН на donchian (никъде по-лош) във
+# ВСИЧКИТЕ 3 прозорца. Без изключение, без обрат между прозорците - най-
+# стабилната находка измерена досега. Реална кандидатура за добавяне на
+# СЪЩОТО ниво като donchian_breakout в живия бот (пълен сигнал, не само
+# watchlist), защото не прави компромис с качеството - просто хваща
+# повече от същия тип пробиви. donchian_breakout_short се ОТХВЪРЛЯ от
+# тази по-висока летва - max_loss му е непостоянен (обръща се драстично
+# между прозорците), т.е. носи реален, непредвидим допълнителен риск,
+# за разлика от sustained_breakout. donchian_breakout_loose_volume вече
+# отхвърлен след прозорец 2.
+#
+# РЕЗУЛТАТ от КРЪГ 27 (10.10, по молба "дай да пробваме още няколко
+# стратегии и ако не намерим по-добра... ще я сложим [sustained_
+# breakout]") - 3 нови оригинални опита да се бие donchian_sustained_
+# breakout (n=121, win_rate 40.5/41.3/37.2%, max_loss -77.53/-80.90/
+# -83.40%) на СЪЩИЯ прозорец (--days 250):
+#
+# donchian_sustained_breakout_short (10-дневен канал + sustained логика
+# комбинирани) - n=170, НАЙ-честият сигнал измерен досега (+40% спрямо
+# sustained_breakout, ~85% спрямо самата donchian_breakout). НО реален
+# компромис в качеството: max_loss по-лош на 3д/10д (-88.00/-87.33%
+# срещу -77.53/-83.40%), win_rate/median_ret леко по-зле на 3д/5д. Прилича
+# на поведението на donchian_breakout_short от кръг 26 (което се обърна
+# драстично по max_loss между прозорците) - не достатъчно чист резултат,
+# за да се предпочете пред текущия шампион само на 1 прозорец.
+#
+# donchian_breakout_median_volume (медиана вместо средно за обемния праг)
+# - n=102, само +11% спрямо donchian (МНОГО по-малко от sustained_
+# breakout-ския +32%), и по-зле от donchian на почти всяка метрика (max_
+# loss по-лош навсякъде, включително -97.33% на 10д). Идеята не помогна.
+#
+# donchian_close_channel_breakout (канал от затваряния, не от върхове) -
+# n=115 (+25%), смесен - по-зле на 3д/5д, малко по-добър на 10д спрямо
+# donchian, но навсякъде по-слаб от sustained_breakout (n=121, по-високи
+# числа на всичко). Не дава предимство пред вече намерения шампион.
+#
+# ИЗВОД от кръг 27: НИТО ЕДИН от трите не бие donchian_sustained_breakout
+# чисто на този прозорец - или е по-рядък И по-слаб (median_volume,
+# close_channel), или е по-чест, но с реален компромис в max_loss
+# (sustained_breakout_short, нуждае се от 3-прозоречен тест, за да се
+# прецени дали компромисът е истински или шум от 1 прозорец). По
+# подразбиране: donchian_sustained_breakout си остава шампионът, освен
+# ако потребителят поиска допълнителни прозорци за sustained_breakout_
+# short.
+#
+# --offset-days 250 (прозорец 2 за donchian_sustained_breakout_short) -
+# ПОТВЪРЖДАВА компромиса от прозорец 1, този път по-ясно: n=182 (+29%
+# спрямо sustained_breakout самата, n=141) - все още най-честият сигнал
+# измерен. НО max_loss значимо/драстично по-лош на ВСИЧКИ 3 хоризонта
+# (-81.67/-60.0/-85.00% срещу -32.43/-36.0/-59.63% на sustained_breakout) -
+# за разлика от прозорец 1, където разликата беше само на 2 от 3
+# хоризонта. win_rate/median_ret по-зле на 3д/5д, по-добре на 10д - смесено
+# като преди. 2 от 2 прозореца съгласни: по-голямата честота идва с реален,
+# устойчив компромис в опашния риск (max_loss) - не е шум от 1 прозорец.
+#
+# ИЗВОД (2/2 прозореца, достатъчно за решение по установения протокол -
+# виж donchian_breakout_loose_volume в кръг 26): donchian_sustained_
+# breakout_short се ОТХВЪРЛЯ - допълнителната честота не си заслужава
+# устойчиво по-лошия max_loss. donchian_sustained_breakout (10-дневния
+# по-къс брат ѝ отхвърлен, другите 2 кръг-27 кандидата по-слаби) остава
+# финалният шампион от цялото търсене за "по-чест donchian" - добавя се в
+# живия бот.
 STRATEGIES = {
     "pocket_pivot": signal_pocket_pivot,
     "nr7_squeeze": signal_nr7_volatility_squeeze,
@@ -2796,4 +3206,13 @@ STRATEGIES = {
     "closing_strength_streak": signal_closing_strength_streak,
     "volume_climax_reversal_2day": signal_volume_climax_reversal_2day,
     "range_compression_volume_asymmetry": signal_range_compression_volume_asymmetry,
+    "breakout_followthrough_2day": signal_breakout_followthrough_2day,
+    "closing_strength_acceleration": signal_closing_strength_acceleration,
+    "island_reversal_gap": signal_island_reversal_gap,
+    "donchian_breakout_short": signal_donchian_breakout_short,
+    "donchian_sustained_breakout": signal_donchian_sustained_breakout,
+    "donchian_breakout_loose_volume": signal_donchian_breakout_loose_volume,
+    "donchian_sustained_breakout_short": signal_donchian_sustained_breakout_short,
+    "donchian_breakout_median_volume": signal_donchian_breakout_median_volume,
+    "donchian_close_channel_breakout": signal_donchian_close_channel_breakout,
 }

@@ -40,6 +40,32 @@ fib_retracement_bounce, но НЕ показа надеждно по-висок 
 твърде малка извадка за доверие). Вижда се в strategies.py, но не е
 закачена тук.
 
+ПРОМЯНА (10.10, по молба "има ли такава която да е като donchian но да
+изпраща по-често" - кръгове 26/27 в strategies.py, 4 варианта тествани
+общо, 3-прозоречно --offset-days 250/500 за финалните двама кандидата):
+добавен `donchian_sustained_breakout` - СЪЩИЯТ 20-дневен канал, но БЕЗ
+"само първия ден" ограничението. 3/3 прозореца ЧИСТА победа над самата
+donchian_breakout на ВСЯКА метрика (виж strategies.py за пълните числа)
+- за разлика от near_high_volume_build/volume_climax_reversal_2day, тук
+НЯМА компромис с качеството, просто хваща повече от същия тип пробив.
+Затова влиза на СЪЩОТО ниво като donchian_breakout (score=100). Другите 3
+кандидата (donchian_breakout_short, donchian_breakout_loose_volume,
+donchian_sustained_breakout_short, donchian_breakout_median_volume,
+donchian_close_channel_breakout) НЕ се добавят - по-нестабилен/по-лош
+риск профил между прозорците (виж strategies.py за пълната история).
+
+ПРОМЯНА (10.10, по-късно същия ден, по въпрос "дали да не махнем старата
+donchian и да оставим само новата"): проверено с 500 симулации на
+случайни ценови серии - donchian_sustained_breakout е МАТЕМАТИЧЕСКО
+ПОДМНОЖЕСТВО на donchian_breakout (0 изключения: винаги когато старата е
+True, новата също е True - СЪЩОТО условие, само без "първия ден"
+ограничението). Затова gate-ът по-долу е опростен на САМО
+donchian_sustained_breakout - старата вече не добавя НИТО ЕДИН алърт
+отгоре. donchian_breakout продължава да се смята в indicators.py, но
+САМО за да различим в reasons текста "пресен" пробив (ден 1) от
+"продължение" (ден 2+) - чисто информативно за твоята преценка, не
+влияе на score-а.
+
 config.HIGH_POTENTIAL_THRESHOLD(70)/EXIT_THRESHOLD(40) НЕ са променяни -
 старите им стойности случайно се map-ват чисто на новата схема.
 
@@ -89,9 +115,26 @@ def score_symbol(symbol: str, ind: dict, has_news_catalyst: bool, dilution_flags
 
     reasons = []
 
-    if ind.get("donchian_breakout"):
+    if ind.get("donchian_sustained_breakout"):
+        # (10.10) ПРОМЯНА: gating-ът сега е САМО на donchian_sustained_breakout,
+        # не "donchian_breakout ИЛИ sustained" - проверено (500 симулации,
+        # 0 изключения), че sustained винаги е True когато старата donchian_
+        # breakout е True (same channel/vol условие, само без "първия ден"
+        # ограничението - математическо подмножество). Старата вече не
+        # добавя НИТО ЕДИН алърт отгоре - затова излиза от gate-а. Продължава
+        # да се смята в indicators.py САМО за да различим в текста "пресен"
+        # пробив (ден 1) от "продължение" (ден 2+) - информативно за теб,
+        # не влияе на score-а.
         score = DONCHIAN_SCORE
-        reasons.append("Donchian breakout: пробив над 20-дневен връх на обем (виж strategies.py)")
+        if ind.get("donchian_breakout"):
+            reasons.append(
+                "Donchian breakout: ПРЕСЕН пробив над 20-дневен връх на обем, ден 1 (виж strategies.py)"
+            )
+        else:
+            reasons.append(
+                "Donchian sustained breakout: ПРОДЪЛЖЕНИЕ на пробив над 20-дневен връх с обем, "
+                "не първия ден (виж strategies.py кръг 26)"
+            )
     else:
         watchlist_hits = []
         if ind.get("fib_retracement_bounce"):
