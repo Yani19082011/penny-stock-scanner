@@ -31,6 +31,7 @@ from flask import Flask
 import config
 from data_sources import (
     AlpacaClient, FinnhubClient, FMPClient, get_sec_dilution_flags, get_bars_yfinance,
+    get_last_regular_session_price,
     get_google_news_rss, get_minute_bars_batch,
 )
 from halts import get_recently_resumed
@@ -238,6 +239,32 @@ def _is_market_hours() -> bool:
 _MIN_DAILY_BARS_FOR_SIGNALS = 90
 
 
+def _price_is_sane(symbol: str, daily_price) -> bool:
+    """Sanity-check (13.10, виж config.PRICE_SANITY_CHECK_* и data_sources.
+    get_last_regular_session_price за пълния контекст - реален инцидент с
+    CLWT алърт показващ $2.15 цена, която потребителят твърди никога не е
+    била реална). Връща True (т.е. "пропускам проверката, не блокирам")
+    при липсваща цена ИЛИ при неуспешна проверка (мрежова грешка/липсващи
+    данни) - не наказваме алърта заради собствен проблем, не заради лоша
+    цена. Връща False САМО когато имаме валидна 1-мин регулярно-сесийна
+    цена, която реално се разминава с дневната над прага - точно сценарият
+    на CLWT инцидента."""
+    if not config.PRICE_SANITY_CHECK_ENABLED or not daily_price:
+        return True
+    check_price = get_last_regular_session_price(symbol)
+    if not check_price:
+        return True
+    deviation_pct = abs(daily_price - check_price) / check_price * 100
+    if deviation_pct > config.PRICE_SANITY_CHECK_MAX_DEVIATION_PCT:
+        log.warning(
+            "%s: дневната цена ($%.4f) се разминава с %.1f%% от 1-мин регулярна цена ($%.4f) - "
+            "пропускам алърта този цикъл (sanity-check, виж config.PRICE_SANITY_CHECK_*).",
+            symbol, daily_price, deviation_pct, check_price,
+        )
+        return False
+    return True
+
+
 def _score_symbols(symbols) -> list:
     scores = []
     # Веднъж на сканиране (не на тикер) - виж halts.py::get_recently_resumed.
@@ -263,7 +290,14 @@ def _score_symbols(symbols) -> list:
                 continue
             catalyst = _has_news_catalyst(symbol, resumed_symbols)
             dilution = get_sec_dilution_flags(symbol)
-            scores.append(score_symbol(symbol, ind, catalyst, dilution))
+            result = score_symbol(symbol, ind, catalyst, dilution)
+            # (13.10) Sanity-check САМО за кандидати, които иначе биха минали
+            # прага за "ВИСОК ПОТЕНЦИАЛ" - пести извиквания, не бавим целия
+            # скан заради тикери, които няма да алъртнат нищо. Виж
+            # _price_is_sane за пълния контекст (CLWT инцидент).
+            if result.is_high_potential and not _price_is_sane(symbol, ind.get("price")):
+                continue
+            scores.append(result)
         except Exception as e:
             log.warning("Грешка при %s: %s", symbol, e)
     return scores

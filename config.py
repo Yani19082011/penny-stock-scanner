@@ -96,15 +96,24 @@ FAST_INTERVAL_MINUTES = int(os.getenv("FAST_INTERVAL_MINUTES", "2"))
 # тикери на бота (цена <= MAX_UNIVERSE_PRICE, без LARGE_CAP_BLOCKLIST), не
 # буквално целия пазар. 1-минутните свещи (условия 2 и 3) идват от yfinance
 # (безплатен, неофициален/reverse-engineered - виж data_sources.
-# get_minute_bars_batch) - очаквай редки 429 грешки в логовете, особено ако
-# свалиш PRICE_SPIKE_INTERVAL_MINUTES под 1 минута.
+# get_minute_bars_batch) - очаквай редки 429 грешки в логовете.
+#
+# ВАЖНО (02.10, намерено след реален инцидент): Render прати "exceeded its
+# memory limit" имейл за този сървис часове след първия деплой на тази
+# функция - yfinance-ският bulk download (pandas DataFrame-и + вътрешни
+# HTTP сесии) на PRICE_SPIKE_TOP_N тикера на всяка минута се оказа твърде
+# тежко за 512MB лимита на Render free tier, натрупвайки памет с времето.
+# Свалени са по подразбиране: интервалът от 1 на 2 мин и топ списъкът от 40
+# на 20 тикера (виж и data_sources.get_minute_bars_batch - вече без threads
+# и с изрично освобождаване на паметта след всяка обиколка). Ако пак видиш
+# "memory limit" имейл, свали ги още (напр. PRICE_SPIKE_TOP_N=10).
 PRICE_SPIKE_ENABLED = _bool("PRICE_SPIKE_ENABLED", True)
-# На колко минути да проверяваме 1-минутните условия (2 и 3) - по спецификация "последна минута".
-PRICE_SPIKE_INTERVAL_MINUTES = int(os.getenv("PRICE_SPIKE_INTERVAL_MINUTES", "1"))
+# На колко минути да проверяваме 1-минутните условия (2 и 3).
+PRICE_SPIKE_INTERVAL_MINUTES = int(os.getenv("PRICE_SPIKE_INTERVAL_MINUTES", "2"))
 # На колко минути да опресняваме топ-N списъка по dollar volume (условие 1) -
 # по-рядко от самата проверка, за да пестим StockAnalysis.com заявките.
 PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES = int(os.getenv("PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES", "5"))
-PRICE_SPIKE_TOP_N = int(os.getenv("PRICE_SPIKE_TOP_N", "40"))
+PRICE_SPIKE_TOP_N = int(os.getenv("PRICE_SPIKE_TOP_N", "20"))
 PRICE_SPIKE_MIN_DOLLAR_VOLUME = float(os.getenv("PRICE_SPIKE_MIN_DOLLAR_VOLUME", "2000000"))
 PRICE_SPIKE_VOLUME_MULTIPLIER = float(os.getenv("PRICE_SPIKE_VOLUME_MULTIPLIER", "2"))
 PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES = int(os.getenv("PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES", "5"))
@@ -184,6 +193,23 @@ PORT = int(os.getenv("PORT", "10000"))
 # пълния контекст (18.09). 5 минути = 3x резерва спрямо 15-те минути праг,
 # на който Render безплатният план приспива service-а без входящ трафик.
 KEEP_ALIVE_PING_MINUTES = int(os.getenv("KEEP_ALIVE_PING_MINUTES", "5"))
+
+# --- Sanity-check защита срещу грешна/нереална "днешна" цена (13.10, по
+# реален инцидент - CLWT алърт показа "Цена: $2.15", докато потребителят
+# твърди, че реалната цена не е минавала над ~$1.56 около това време -
+# виж data_sources.get_last_regular_session_price / main.py::
+# _price_is_sane за пълния технически контекст). "Днешният" ред от
+# get_bars_yfinance(interval="1d", prepost=True) е ОЩЕ недовършена свещ,
+# докато пазарът е отворен - при силно неликвиден penny stock единичен
+# грешен/нереален принт може временно да изглежда като "последна цена" и
+# дори да задейства donchian сигнала фалшиво. Затова, САМО за кандидати,
+# които иначе биха пратили "ВИСОК ПОТЕНЦИАЛ" алърт, правим бърза
+# допълнителна 1-минутна (редовна сесия) проверка - ако разминаването е
+# над прага, пропускаме алърта ТОЗИ цикъл (не завинаги - следващият бърз
+# цикъл проверява пак със свежи данни, същия принцип като anti-spam
+# retry-логиката в notifier.can_send_now).
+PRICE_SANITY_CHECK_ENABLED = _bool("PRICE_SANITY_CHECK_ENABLED", True)
+PRICE_SANITY_CHECK_MAX_DEVIATION_PCT = float(os.getenv("PRICE_SANITY_CHECK_MAX_DEVIATION_PCT", "12"))
 
 # --- Трайна памет отвъд Render локалния диск (по избор) ---
 # Виж коментара в watchlist.py::load_watchlist за пълния контекст (18.09,

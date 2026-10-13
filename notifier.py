@@ -83,10 +83,20 @@ def _mark_email_sent():
 
 
 def format_alert(kind: str, result: ScoreResult) -> str:
+    """ПОПРАВКА (13.10, по реален инцидент - потребителят получи email с
+    "Цена: $2.1500000953674316" за CLWT вместо $2.15): цената идва като
+    numpy/pandas float (често float32 отвътре в yfinance/pandas данните),
+    който при директно вмъкване в f-string показва пълната двоична
+    апроксимация, не закръгленото число. Преди тук НЯМАШЕ форматиране
+    изобщо (само `${result.raw.get('price')}`) - сега закръгля до 4
+    знака след десетичната точка (достатъчно за penny stock цени под
+    $5, виж config.py), и пази "N/A" ако цената липсва."""
     target_pct = round(config.TARGET_PROFIT_PCT * 100)
+    _price = result.raw.get('price')
+    _price_str = f"{_price:.4f}" if isinstance(_price, (int, float)) else "N/A"
     lines = [
         f"[{kind}] {result.symbol} — score {result.score}/100",
-        f"Цена: ${result.raw.get('price')}",
+        f"Цена: ${_price_str}",
         f"Потенциал: ~{target_pct}% return "
         f"(позиция {config.POSITION_SIZE_EUR}€ -> цел {config.TARGET_PROFIT_EUR}€)",
         "Причини: " + "; ".join(result.reasons) if result.reasons else "",

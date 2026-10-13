@@ -113,6 +113,33 @@ def get_bars_yfinance(symbol: str, interval: str = "5m", period: str = "5d", lim
         return pd.DataFrame()
 
 
+def get_last_regular_session_price(symbol: str) -> float | None:
+    """Sanity-check помощник (13.10, по реален инцидент - CLWT алърт показа
+    "Цена: $2.15", докато потребителят твърди, че реалната цена не е
+    минавала над ~$1.56 около това време - виж main.py::_price_is_sane /
+    config.PRICE_SANITY_CHECK_* за пълния контекст). Разликата от
+    get_bars_yfinance по-горе: тук е 1-минутна свещ и prepost=False (САМО
+    редовна сесия) - умишлено, защото целта е проверка, не самия сигнал:
+    "днешният" ред на ДНЕВНИЯ бар (interval='1d', prepost=True) е още
+    недовършена свещ, докато пазарът е отворен, и при силно неликвиден
+    penny stock единичен грешен/нереален принт (или остатъчен pre-market
+    принт) може временно да изглежда като "последна цена". 1-минутната
+    редовна-сесийна свещ е по-малко податлива на точно този вид артефакт,
+    защото идва от отделна, по-фина агрегация.
+
+    Връща None при провал/липсващи данни - викащият код тогава НЕ наказва
+    алърта заради собствена мрежова грешка, просто пропуска проверката."""
+    try:
+        import yfinance as yf
+        df = yf.Ticker(symbol).history(period="1d", interval="1m", prepost=False)
+        if df.empty:
+            return None
+        return float(df["Close"].iloc[-1])
+    except Exception as e:
+        log.warning("yfinance 1-мин sanity-check fail за %s: %s", symbol, e)
+        return None
+
+
 def get_minute_bars_batch(symbols: list[str], lookback_minutes: int = 15) -> dict[str, "pd.DataFrame"]:
     """Bulk 1-минутни свещи за НЯКОЛКО тикера наведнъж (yfinance) - за
     main.py::run_price_spike_scan (01.10, по изрична спецификация на
@@ -125,7 +152,17 @@ def get_minute_bars_batch(symbols: list[str], lookback_minutes: int = 15) -> dic
 
     prepost=True включва pre/post market свещи - нужно е изрично, за да
     хванем pre-market скок (целта на цялата функция - потребителят иска да
-    влиза 10-15 мин ПРЕДИ скока, обичайно точно в pre-market)."""
+    влиза 10-15 мин ПРЕДИ скока, обичайно точно в pre-market).
+
+    ВАЖНО (02.10, по реален "exceeded its memory limit" инцидент на Render -
+    виж config.py за пълния контекст): threads=True ПРЕМАХНАТО нарочно -
+    паралелните downloads трупаха памет по-бързо от 512MB лимита на Render
+    free tier, когато функцията се вика на всяка минута. Сега е
+    последователно (по-бавно, но стабилно по памет) + изрично чистим
+    references-ите към суровия `data` DataFrame и викаме gc.collect() в
+    края, за да върнем паметта към ОС веднага, вместо да чакаме Python да го
+    направи сам (pandas DataFrame-ите са известни с това, че фрагментират
+    паметта при чест repeat-call в дълго-живеещ процес)."""
     result: dict = {}
     if not symbols:
         return result
@@ -133,7 +170,7 @@ def get_minute_bars_batch(symbols: list[str], lookback_minutes: int = 15) -> dic
         import yfinance as yf
         data = yf.download(
             tickers=" ".join(symbols), period="1d", interval="1m",
-            group_by="ticker", prepost=True, progress=False, threads=True,
+            group_by="ticker", prepost=True, progress=False, threads=False,
         )
     except Exception as e:
         log.warning("yfinance bulk 1-мин свещи се провалиха за %d тикера: %s", len(symbols), e)
@@ -148,9 +185,10 @@ def get_minute_bars_batch(symbols: list[str], lookback_minutes: int = 15) -> dic
                 })
                 df = df.dropna(subset=["close", "volume"])
                 if not df.empty:
-                    result[symbol] = df[["open", "high", "low", "close", "volume"]].tail(lookback_minutes)
+                    result[symbol] = df[["open", "high", "low", "close", "volume"]].tail(lookback_minutes).copy()
             except Exception:
                 continue  # този тикер липсва/друга форма в bulk резултата - individualния fallback по-долу го хваща
+    del data  # освобождаваме големия суров multi-ticker DataFrame веднага, не чакаме края на функцията
 
     # Fallback поотделно само за тикерите, които bulk заявката не покри.
     missing = [s for s in symbols if s not in result]
@@ -158,6 +196,9 @@ def get_minute_bars_batch(symbols: list[str], lookback_minutes: int = 15) -> dic
         df = get_bars_yfinance(symbol, interval="1m", period="1d", limit=lookback_minutes)
         if not df.empty:
             result[symbol] = df
+
+    import gc
+    gc.collect()
     return result
 
 
