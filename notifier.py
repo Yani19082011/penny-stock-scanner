@@ -1,225 +1,201 @@
 """
-Изпращане на алърти. Три канала:
-  - лог (винаги, вижда се в Render "Logs" таба)
-  - email през Resend (https://resend.com) - HTTP API, само ако
-    ALERT_EMAIL_ENABLED=true и RESEND_API_KEY е попълнен.
-  - Telegram (01.10) - само за "ЦЕНОВИ СКОК" сигналите (виж
-    send_price_spike_alert), само ако TELEGRAM_ENABLED=true и
-    TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID са попълнени - виж README.md.
+Sends alert emails through the Resend HTTP API (https://resend.com).
 
-Забележка: НЕ ползваме Gmail SMTP/App Password, защото Google не позволява
-App Passwords на Family Link (supervised) акаунти. Resend е безплатна услуга,
-праща email през обикновен HTTP POST с API ключ - виж README.md за стъпките.
+Resend is used instead of Gmail SMTP because Gmail App Passwords are
+unavailable on accounts under Family Link / advanced protection, and
+Resend needs only a plain API key, no OAuth or app-password setup.
 """
 import logging
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 import requests
 
+import champion_strategy
 import config
-from scoring import ScoreResult
 
-log = logging.getLogger("notifier")
+log = logging.getLogger("gold_signal_bot.notifier")
 
-RESEND_API_URL = "https://api.resend.com/emails"
-
-
-def _within_active_hours() -> bool:
-    """Проверява дали текущият момент е в разрешения прозорец за имейли
-    (config.ALERT_ACTIVE_START_* / ALERT_ACTIVE_END_* в ALERT_QUIET_HOURS_TZ).
-    Ако timezone данните липсват по някаква причина - НЕ блокираме (по-добре
-    да получиш имейл в грешен час, отколкото да мълчим заради bug)."""
-    try:
-        tz = ZoneInfo(config.ALERT_QUIET_HOURS_TZ)
-    except Exception as e:
-        log.warning("ALERT_QUIET_HOURS_TZ (%s) невалиден: %s - пропускам проверката за часове.", config.ALERT_QUIET_HOURS_TZ, e)
-        return True
-    now_local = datetime.now(tz)
-    start = now_local.replace(hour=config.ALERT_ACTIVE_START_HOUR, minute=config.ALERT_ACTIVE_START_MINUTE, second=0, microsecond=0)
-    end = now_local.replace(hour=config.ALERT_ACTIVE_END_HOUR, minute=config.ALERT_ACTIVE_END_MINUTE, second=0, microsecond=0)
-    return start <= now_local <= end
-
-# --- Anti-spam темпо-ограничител за Resend (виж config.MIN_EMAIL_INTERVAL_SECONDS /
-# MAX_EMAILS_PER_DAY) - пази в паметта на процеса, реду се при restart на Render,
-# но това е ок - целта е само да не гърмим много имейли наведнъж при серия алърти. ---
-_last_sent_at = None
-_daily_count = 0
-_daily_reset_date = None
+RESEND_URL = "https://api.resend.com/emails"
 
 
-def _rate_limit_ok() -> bool:
-    global _last_sent_at, _daily_count, _daily_reset_date
-    now = datetime.now(timezone.utc)
-    today = now.date()
-
-    if _daily_reset_date != today:
-        _daily_reset_date = today
-        _daily_count = 0
-
-    if _daily_count >= config.MAX_EMAILS_PER_DAY:
-        log.warning(
-            "Дневният лимит от %d имейла е достигнат - пропускам email-а (алъртът е в логовете).",
-            config.MAX_EMAILS_PER_DAY,
-        )
+def _send(subject: str, html: str) -> bool:
+    if not config.RESEND_API_KEY:
+        log.error("RESEND_API_KEY is not set - cannot send email. See README for setup steps.")
         return False
 
-    if _last_sent_at is not None:
-        elapsed = (now - _last_sent_at).total_seconds()
-        if elapsed < config.MIN_EMAIL_INTERVAL_SECONDS:
-            log.info(
-                "Прескачам email (анти-спам темпо) - оставащи %.0fс до следващия разрешен имейл.",
-                config.MIN_EMAIL_INTERVAL_SECONDS - elapsed,
-            )
-            return False
+    payload = {
+        "from": config.ALERT_FROM_EMAIL,
+        "to": [config.ALERT_EMAIL],
+        "subject": subject,
+        "html": html,
+    }
+    headers = {"Authorization": f"Bearer {config.RESEND_API_KEY}"}
 
-    return True
-
-
-def _mark_email_sent():
-    global _last_sent_at, _daily_count
-    _last_sent_at = datetime.now(timezone.utc)
-    _daily_count += 1
-
-
-def format_alert(kind: str, result: ScoreResult) -> str:
-    """ПОПРАВКА (13.10, по реален инцидент - потребителят получи email с
-    "Цена: $2.1500000953674316" за CLWT вместо $2.15): цената идва като
-    numpy/pandas float (често float32 отвътре в yfinance/pandas данните),
-    който при директно вмъкване в f-string показва пълната двоична
-    апроксимация, не закръгленото число. Преди тук НЯМАШЕ форматиране
-    изобщо (само `${result.raw.get('price')}`) - сега закръгля до 4
-    знака след десетичната точка (достатъчно за penny stock цени под
-    $5, виж config.py), и пази "N/A" ако цената липсва."""
-    target_pct = round(config.TARGET_PROFIT_PCT * 100)
-    _price = result.raw.get('price')
-    _price_str = f"{_price:.4f}" if isinstance(_price, (int, float)) else "N/A"
-    lines = [
-        f"[{kind}] {result.symbol} — score {result.score}/100",
-        f"Цена: ${_price_str}",
-        f"Потенциал: ~{target_pct}% return "
-        f"(позиция {config.POSITION_SIZE_EUR}€ -> цел {config.TARGET_PROFIT_EUR}€)",
-        "Причини: " + "; ".join(result.reasons) if result.reasons else "",
-    ]
-    return "\n".join(l for l in lines if l)
-
-
-def can_send_now() -> bool:
-    """Pure "peek" - True ако email, пратен точно СЕГА, НЕ би бил пропуснат
-    заради anti-spam темпото (MIN_EMAIL_INTERVAL_SECONDS/MAX_EMAILS_PER_DAY).
-    main.py я ползва, за да НЕ маркира тикер като "вече алъртнат", когато
-    реално email-ът е бил пропуснат заради темпото - виж коментара в
-    main.py::_maybe_alert_high_potential (18.09)."""
-    return _rate_limit_ok()
-
-
-def send_alert(kind: str, result: ScoreResult) -> bool:
-    """Връща True ако е "обработено" (пратен успешно, ИЛИ email-ите са
-    изключени/не са конфигурирани, ИЛИ извън разрешените часове - retry не
-    би помогнал), False САМО ако е пропуснат чисто заради anti-spam темпото."""
-    message = format_alert(kind, result)
-    log.info("ALERT:\n%s", message)
-
-    if not config.ALERT_EMAIL_ENABLED:
-        return True
-    return _send_email(subject=f"[Penny Stock Scanner] {result.symbol} - {kind}", body=message)
-
-
-TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
-
-
-def send_telegram_message(text: str) -> bool:
-    """Праща съобщение през Telegram Bot API - прост HTTP POST, без
-    допълнителна библиотека (01.10, виж README.md за стъпките да си
-    направиш бот през @BotFather и да вземеш chat_id-то си). Връща True само
-    при реално успешно изпратено съобщение - False ако Telegram не е
-    конфигуриран/включен, или заявката се провали (извикващият код тогава
-    решава дали да пробва email fallback - виж send_price_spike_alert)."""
-    if not (config.TELEGRAM_ENABLED and config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
-        return False
     try:
-        resp = requests.post(
-            TELEGRAM_API_URL.format(token=config.TELEGRAM_BOT_TOKEN),
-            json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text},
-            timeout=15,
-        )
+        resp = requests.post(RESEND_URL, json=payload, headers=headers, timeout=20)
         if resp.status_code >= 300:
-            log.error("Telegram отказа изпращането (%s): %s", resp.status_code, resp.text)
+            log.error("Resend API error %s: %s", resp.status_code, resp.text)
             return False
-        log.info("Telegram алърт изпратен успешно.")
+        # Log Resend's own message id (24.09, by user request after a "log
+        # says sent but no email arrived" report) - the API returning 2xx
+        # only means Resend ACCEPTED the request, not that it was delivered
+        # to the inbox (it can still bounce/land in spam/get blocked
+        # afterwards). Logging the id lets you look this exact message up
+        # at resend.com/emails to see its real delivery status.
+        resend_id = None
+        try:
+            resend_id = resp.json().get("id")
+        except Exception:  # noqa: BLE001
+            pass
+        log.info("Alert email accepted by Resend: %s (id=%s, to=%s) - check resend.com/emails for actual delivery status",
+                  subject, resend_id, config.ALERT_EMAIL)
         return True
-    except Exception as e:
-        log.error("Изпращането през Telegram се провали: %s", e)
+    except Exception as exc:  # noqa: BLE001
+        log.error("Failed to send email via Resend: %s", exc)
         return False
 
 
-def send_price_spike_alert(symbol: str, price, price_change_pct, last_minute_volume, avg_prior_volume, dollar_volume) -> bool:
-    """"ЦЕНОВИ СКОК" сигнал (01.10, по ТОЧНА спецификация на потребителя -
-    заменя старата send_volume_surge_alert). Условията (топ-N по dollar
-    volume + обем последна минута >= Nx средния + цена нагоре >= X% за N мин)
-    вече са проверени в main.py::run_price_spike_scan ПРЕДИ да се стигне
-    дотук - тук само форматираме и пращаме.
+def send_signal_email(result, instrument: dict) -> bool:
+    is_buy = result.direction == "BUY"
+    emoji = "🟢" if is_buy else "🔴"
+    action_bg = "#e8f5e9" if is_buy else "#fdecea"
+    action_color = "#1b5e20" if is_buy else "#b71c1c"
+    action_text = "ПОКУПКА (BUY)" if is_buy else "ПРОДАЖБА (SELL)"
+    name = instrument["name"]
+    cur = instrument.get("currency", "$")
 
-    Канал: Telegram (config.TELEGRAM_*) - по избор на потребителя, за
-    по-бързо известяване на телефона, вместо email. Ако Telegram не е
-    конфигуриран/се провали, пада обратно на email (ако е включен) - по-добре
-    закъснял email, отколкото напълно изгубен сигнал.
-
-    НИКОГА не пуска поръчка - само наблюдава и известява, потребителят решава
-    сам дали и как да влезе (виж README.md)."""
-    message = (
-        f"🚀 ЦЕНОВИ СКОК: {symbol}\n"
-        f"Цена: ${price:.4f}"
-        + (f" ({price_change_pct:+.1f}% за последните {config.PRICE_SPIKE_PRICE_LOOKBACK_MINUTES} мин)" if price_change_pct is not None else "")
-        + "\n"
-        f"Обем последна минута: {last_minute_volume:,.0f} "
-        f"(средно предходни {config.PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES} мин: {avg_prior_volume:,.0f})\n"
-        f"Dollar volume днес: ${dollar_volume:,.0f}\n"
-        "⚠️ Само наблюдение - БОТЪТ НЕ пуска поръчки - провери сам графиката/новините преди да влезеш."
+    reasons_html = "".join(f"<li>{r}</li>" for r in result.reasons)
+    sizing_note = (
+        "на база подобна ситуация от последните ~1-2 дни"
+        if getattr(result, "sizing_method", "atr") == "analog"
+        else "на база средна волатилност (ATR)"
     )
-    log.info("ЦЕНОВИ СКОК:\n%s", message)
 
-    if send_telegram_message(message):
-        return True
-    if not config.ALERT_EMAIL_ENABLED:
-        return True
-    return _send_email(subject=f"[Penny Stock Scanner] {symbol} - ЦЕНОВИ СКОК", body=message)
+    subject = f"{emoji} Сигнал за {action_text} - {name} @ {cur}{result.price:,.2f}"
+    html = f"""
+    <div style="font-family: -apple-system, Arial, sans-serif; max-width: 560px; margin: 0 auto;">
+      <div style="background:{action_bg}; color:{action_color}; padding:16px 20px; border-radius:10px 10px 0 0;">
+        <h2 style="margin:0; font-size:20px;">{emoji} {name}: {action_text}</h2>
+        <p style="margin:4px 0 0; font-size:14px;">Увереност: {result.score}/{result.max_score} потвърждаващи индикатора</p>
+      </div>
+      <div style="border:1px solid #eee; border-top:none; padding:20px; border-radius:0 0 10px 10px;">
+        <table style="width:100%; border-collapse:collapse; font-size:14px; margin-bottom:16px;">
+          <tr><td style="padding:4px 0; color:#666;">Цена</td><td style="text-align:right; font-weight:600;">{cur}{result.price:,.2f}</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">RSI (14)</td><td style="text-align:right;">{result.rsi:.1f}</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">Предложен Stop-Loss</td><td style="text-align:right;">{cur}{result.stop_loss:,.2f}</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">Предложен Take-Profit</td><td style="text-align:right;">{cur}{result.take_profit:,.2f}</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">Час на сигнала (UTC)</td><td style="text-align:right;">{result.timestamp}</td></tr>
+        </table>
+        <p style="font-size:12px; color:#888; margin:-10px 0 16px;">Stop-Loss/Take-Profit изчислени {sizing_note} - нива, не гарантирани.</p>
+        <p style="font-size:14px; color:#333; margin-bottom:6px;"><strong>Защо се задейства сигналът:</strong></p>
+        <ul style="font-size:13px; color:#444; margin-top:0; padding-left:18px;">{reasons_html}</ul>
+        <p style="font-size:11px; color:#999; margin-top:18px; border-top:1px solid #eee; padding-top:10px;">
+          Автоматичен сигнал от технически индикатори (EMA, RSI, MACD, Bollinger Bands,
+          свещни фигури, аналогични ситуации от последните дни).
+          Това не е финансов съвет - пазарът се движи и от новини (лихви,
+          геополитика, макро данни), които тези индикатори не виждат.
+          Провери сам преди да отвориш позиция.
+        </p>
+      </div>
+    </div>
+    """
+    return _send(subject, html)
 
 
-def _send_email(subject: str, body: str) -> bool:
-    if not (config.RESEND_API_KEY and config.ALERT_EMAIL_TO):
-        log.warning("Email алъртите са включени, но RESEND_API_KEY или ALERT_EMAIL_TO не са попълнени.")
-        return True
-    if not _within_active_hours():
-        log.info(
-            "Извън разрешените часове за имейли (%02d:%02d-%02d:%02d %s) - пропускам email-а (алъртът е в логовете).",
-            config.ALERT_ACTIVE_START_HOUR, config.ALERT_ACTIVE_START_MINUTE,
-            config.ALERT_ACTIVE_END_HOUR, config.ALERT_ACTIVE_END_MINUTE, config.ALERT_QUIET_HOURS_TZ,
-        )
-        return True
-    if not _rate_limit_ok():
-        return False
-    try:
-        resp = requests.post(
-            RESEND_API_URL,
-            headers={
-                "Authorization": f"Bearer {config.RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": config.RESEND_FROM_EMAIL,
-                "to": [config.ALERT_EMAIL_TO],
-                "subject": subject,
-                "text": body,
-            },
-            timeout=15,
-        )
-        if resp.status_code >= 300:
-            log.error("Resend отказа изпращането (%s): %s", resp.status_code, resp.text)
-            return True  # HTTP грешка, не anti-spam темпо - не искаме безкраен retry цикъл
-        _mark_email_sent()
-        log.info("Email алърт изпратен до %s през Resend", config.ALERT_EMAIL_TO)
-        return True
-    except Exception as e:
-        log.error("Изпращането на email през Resend се провали: %s", e)
-        return True  # мрежова грешка, вече е логнато - не anti-spam темпо
+def send_champion_signal_email(result, instrument_name: str = None) -> bool:
+    """Имейл при LONG/SHORT сигнал от шампионската стратегия (виж
+    champion_strategy.py) - изпраща се на всеки checkpoint, когато
+    quiet_accumulation и ema_trend се съгласят."""
+    instrument_name = instrument_name or config.GOLD_INSTRUMENT["name"]
+    is_long = result.direction == "LONG"
+    emoji = "🟢" if is_long else "🔴"
+    action_bg = "#e8f5e9" if is_long else "#fdecea"
+    action_color = "#1b5e20" if is_long else "#b71c1c"
+    action_text = "LONG (покупка)" if is_long else "SHORT (продажба)"
+
+    reasons_html = "".join(f"<li>{r}</li>" for r in result.reasons)
+    dist, dist_pct = result.tp_sl_distance, result.tp_sl_distance_pct
+
+    subject = f"{emoji} Шампионска стратегия: {action_text} - {instrument_name} @ ${result.price:,.2f}"
+    html = f"""
+    <div style="font-family: -apple-system, Arial, sans-serif; max-width: 560px; margin: 0 auto;">
+      <div style="background:{action_bg}; color:{action_color}; padding:16px 20px; border-radius:10px 10px 0 0;">
+        <h2 style="margin:0; font-size:20px;">{emoji} {instrument_name}: {action_text}</h2>
+        <p style="margin:4px 0 0; font-size:14px;">quiet_accumulation + ema_trend са съгласни</p>
+      </div>
+      <div style="border:1px solid #eee; border-top:none; padding:20px; border-radius:0 0 10px 10px;">
+        <table style="width:100%; border-collapse:collapse; font-size:14px; margin-bottom:16px;">
+          <tr><td style="padding:4px 0; color:#666;">Цена (вход)</td><td style="text-align:right; font-weight:600;">${result.price:,.2f}</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">Stop-Loss</td><td style="text-align:right;">${result.stop_loss:,.2f}</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">Take-Profit</td><td style="text-align:right;">${result.take_profit:,.2f}</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">Разстояние TP/SL (прибл.)</td><td style="text-align:right;">±${dist:,.2f} (~{dist_pct:.2f}%)</td></tr>
+          <tr><td style="padding:4px 0; color:#666;">Час на свещта</td><td style="text-align:right;">{result.timestamp}</td></tr>
+        </table>
+        <p style="font-size:14px; color:#333; margin-bottom:6px;"><strong>Защо:</strong></p>
+        <ul style="font-size:13px; color:#444; margin-top:0; padding-left:18px;">{reasons_html}</ul>
+        <p style="font-size:11px; color:#999; margin-top:18px; border-top:1px solid #eee; padding-top:10px;">
+          Честен backtest (GC=F, 1h свещи, проверка в {champion_strategy.BACKTEST_CHECKPOINT}, 1:1 ATR R:R, ~880 дни история):
+          {champion_strategy.BACKTEST_WIN_RATE_PCT}% win rate на {champion_strategy.BACKTEST_SIGNALS} сигнала,
+          out-of-sample {champion_strategy.BACKTEST_OOS_OLDER_PCT}% -> {champion_strategy.BACKTEST_OOS_NEWER_PCT}%,
+          4 отделни тримесечия {champion_strategy.BACKTEST_QUARTER_MIN_PCT}%-{champion_strategy.BACKTEST_QUARTER_MAX_PCT}%
+          (random baseline ~{champion_strategy.BACKTEST_RANDOM_BASELINE_PCT}%). Това НЕ е гаранция за бъдещето -
+          пазарът може да промени режим по всяко време, а новини (лихви, геополитика, макро данни) не се виждат
+          в тези индикатори. Провери сам преди да отвориш позиция - не е финансов съвет.
+        </p>
+      </div>
+    </div>
+    """
+    return _send(subject, html)
+
+
+def send_champion_flat_email(result, instrument_name: str = None) -> bool:
+    """Имейл при FLAT (под-стратегиите не са съгласни, или едната мълчи) -
+    изпраща се ВИНАГИ на всеки checkpoint, за да има честен отговор на
+    всяка проверка, без форсирана LONG/SHORT догадка само за да има какво
+    да пише в имейла."""
+    instrument_name = instrument_name or config.GOLD_INSTRUMENT["name"]
+    reasons_html = "".join(f"<li>{r}</li>" for r in result.reasons)
+    price_part = f" @ ${result.price:,.2f}" if result.price else ""
+    subject = f"⚪ Шампионска стратегия: FLAT (без сигнал) - {instrument_name}{price_part}"
+    html = f"""
+    <div style="font-family: -apple-system, Arial, sans-serif; max-width: 560px; margin: 0 auto;">
+      <div style="background:#f0f0f0; color:#555; padding:16px 20px; border-radius:10px 10px 0 0;">
+        <h2 style="margin:0; font-size:20px;">⚪ {instrument_name}: FLAT</h2>
+        <p style="margin:4px 0 0; font-size:14px;">Честно - няма ясен edge точно сега.</p>
+      </div>
+      <div style="border:1px solid #eee; border-top:none; padding:20px; border-radius:0 0 10px 10px;">
+        <ul style="font-size:13px; color:#444; margin-top:0; padding-left:18px;">{reasons_html}</ul>
+        <p style="font-size:11px; color:#999; margin-top:18px; border-top:1px solid #eee; padding-top:10px;">
+          По-добре честно FLAT, отколкото форсирана LONG/SHORT догадка само за да има какво да пише в имейла -
+          шампионската стратегия (quiet_accumulation+ema_trend) е валидирана само за моментите, в които
+          двете под-стратегии реално се съгласят ({champion_strategy.BACKTEST_SIGNALS} сигнала в честния
+          backtest, проверка в {champion_strategy.BACKTEST_CHECKPOINT}). Следващата проверка е на следващия checkpoint.
+        </p>
+      </div>
+    </div>
+    """
+    return _send(subject, html)
+
+
+def send_test_email() -> bool:
+    import config
+    names = [inst["name"] for inst in config.INSTRUMENTS]
+    if config.ENABLE_GOLD:
+        checkpoints = ", ".join(f"{h:02d}:{m:02d}" for h, m in config.CHAMPION_CHECKPOINTS)
+        names.insert(0, f"{config.GOLD_INSTRUMENT['name']} (шампионска стратегия, checkpoint-и в {checkpoints} {config.CHAMPION_CHECKPOINTS_TZ})")
+    names_str = ", ".join(names) or "(няма конфигурирани инструменти)"
+    # By user request (02.10): текстът още казваше "само при покупка", въпреки
+    # че от 24.09 ALERT_ONLY_BUY=false по подразбиране и SELL също се праща -
+    # подвеждащо след всеки рестарт. Вече отразява реалната конфигурация.
+    signal_kind = "сигнал за покупка" if config.ALERT_ONLY_BUY else "сигнал за покупка или продажба"
+    return _send(
+        "✅ GoldSignalBot е стартиран",
+        f"<p>Ботът стартира успешно и ще ти изпраща имейл при {signal_kind} "
+        f"на следените инструменти: {names_str}.</p>",
+    )
+
+
+def send_error_email(instrument_key: str, message: str) -> bool:
+    return _send(
+        f"⚠️ GoldSignalBot - грешка при извличане на данни ({instrument_key})",
+        f"<p>Ботът не успя да изтегли цената за {instrument_key} няколко пъти подред:</p><pre>{message}</pre>",
+    )

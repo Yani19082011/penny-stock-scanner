@@ -1,229 +1,351 @@
 """
-Централна конфигурация - чете всичко от environment variables (.env локално,
-или Railway "Variables" таб в продукция). Никакви ключове не се пишат тук.
+Configuration for GoldSignalBot, loaded from environment variables.
+Copy .env.example to .env locally, or set these as Environment Variables
+in your Render service settings.
 """
 import os
-from dotenv import load_dotenv
-
-load_dotenv()  # локално чете .env; на Railway .env не съществува, но Railway
-                # вкарва Variables директно в environment, така че пак работи.
 
 
-def _bool(name: str, default: bool = False) -> bool:
-    val = os.getenv(name)
+def _bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name)
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-# --- Alpaca ---
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-ALPACA_DATA_URL = os.getenv("ALPACA_DATA_URL", "https://data.alpaca.markets")
+def _float(name: str, default: float) -> float:
+    val = os.environ.get(name)
+    try:
+        return float(val) if val is not None else default
+    except ValueError:
+        return default
 
-# --- Finnhub / FMP ---
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
 
-# --- Scoring прагове (виж scoring.py::ScoreResult) ---
-# ВАЖНО (18.09, намерено при цялостен преглед на кода): scoring.py досега
-# имаше СВОИ собствени hardcoded module-level константи (HIGH_POTENTIAL_
-# THRESHOLD=70, EXIT_THRESHOLD=40) и НИКОГА не четеше config.py - т.е.
-# промяна на HIGH_POTENTIAL_THRESHOLD през .env/Render Environment Variables
-# нямаше АБСОЛЮТНО НИКАКЪВ ефект върху реалното поведение на бота. Сега
-# scoring.py чете директно config.HIGH_POTENTIAL_THRESHOLD/config.EXIT_
-# THRESHOLD - стойностите по подразбиране по-долу пазят точно старото
-# поведение (70/40), просто вече реално се четат от тук.
-HIGH_POTENTIAL_THRESHOLD = float(os.getenv("HIGH_POTENTIAL_THRESHOLD", "70"))
-EXIT_THRESHOLD = float(os.getenv("EXIT_THRESHOLD", "40"))
+def _int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    try:
+        return int(val) if val is not None else default
+    except ValueError:
+        return default
 
-# --- Watchlist / universe ---
-MAX_UNIVERSE_PRICE = float(os.getenv("MAX_UNIVERSE_PRICE", "10"))
-# Горен праг на пазарна капитализация - за да са РЕАЛНИ penny stocks (малки,
-# спекулативни компании), не просто големи имена (MARA, NIO, F, AMC...),
-# които случайно търгуват евтино. $300M е стандартна граница за "micro-cap".
+
+# --- Data sources ------------------------------------------------------------
+# Candles are fetched from several providers, in this order, so a single
+# provider being down, rate-limited, or blocking cloud IPs doesn't take the
+# bot offline:
+#   1. Yahoo Finance, primary ticker
+#   2. Yahoo Finance, fallback ticker
+#   3. Twelve Data (only if TWELVEDATA_API_KEY is set - free key at
+#      twelvedata.com, no card required, 800 requests/day on the free plan)
+#   4. stooq.com daily candles (last resort - see ALLOW_DAILY_FALLBACK below,
+#      OFF by default since 24.09)
+TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY", "")
+
+# By user request (24.09 - "искам цената да се променя, преди не се
+# променяше на всеки имейл"): stooq.com's free endpoint only serves DAILY
+# candles, never 15-minute ones. If Yahoo Finance fails (common from
+# Render's IP) and no TWELVEDATA_API_KEY is set, the bot used to silently
+# fall back to that once-a-day price and keep computing "15-minute"
+# indicators on it - which is why the price (and the signal) could look
+# frozen for hours: the underlying data genuinely wasn't updating.
+# ALLOW_DAILY_FALLBACK=false (the default) stops that: if only daily data
+# is available, get_candles() raises instead of quietly using it, so the
+# existing consecutive-failure error email fires and tells you to add/check
+# TWELVEDATA_API_KEY - instead of you getting a signal that looks live but
+# is actually hours stale. Set to true only if you'd rather have a coarse
+# daily-only signal than no signal at all (not recommended for this bot's
+# whole confluence/analog-match design, which assumes real 15m candles).
+ALLOW_DAILY_FALLBACK = _bool("ALLOW_DAILY_FALLBACK", False)
+
+# Per-request network timeout (seconds) for every price-data HTTP call
+# (Yahoo, Twelve Data, stooq). By user request (24.09): keep one full check
+# cycle fast (~20-30s max end-to-end, ideally much faster) instead of
+# possibly hanging - this bounds the worst realistic case (every source
+# timing out back-to-back) to roughly 4x this value.
+FETCH_TIMEOUT_SECONDS = _int("FETCH_TIMEOUT_SECONDS", 8)
+
+# По заявка (10.10, обновено 13.10): GC=F (COMEX gold futures) е тикерът,
+# върху който шампионската стратегия (quiet_accumulation+ema_trend, виж
+# champion_strategy.py) беше честно backtest-вана и валидирана (63.3% win
+# rate на 123 сигнала, пълна ~880-дневна история; out-of-sample 62.9%->
+# 64.9%; 4 непресичащи се тримесечия 53.8%/69.4%/63.6%/66.7% - нито едно
+# под 50%) - затова е primary сега, не fallback. XAUUSD=X (спот
+# форекс-стил тикер) е различен инструмент с различни часове на търговия и
+# форма на свещите, затова е само резервен вариант, ако GC=F временно не
+# отговори.
+GOLD_TICKER = os.environ.get("GOLD_TICKER", "GC=F")
+GOLD_TICKER_FALLBACK = os.environ.get("GOLD_TICKER_FALLBACK", "XAUUSD=X")
+GOLD_TWELVEDATA_SYMBOL = os.environ.get("TWELVEDATA_SYMBOL", os.environ.get("GOLD_TWELVEDATA_SYMBOL", "XAU/USD"))
+GOLD_STOOQ_SYMBOL = os.environ.get("GOLD_STOOQ_SYMBOL", "xauusd")
+
+# USA Tech 100 / Nasdaq-100 (the "TECH100" CFD most brokers, incl. eToro,
+# offer). Tracked via Nasdaq-100 futures (NQ=F) primarily - futures trade
+# near-24h like the CFD does, unlike the ^NDX cash index which only moves
+# during US market hours.
 #
-# ВАЖНО: FMP-ският company-screener/quote endpoint (единственият, който дава
-# marketCap директно) изисква ПЛАТЕН FMP план - потвърдено с реалния ключ на
-# потребителя (402 Payment Required). Безплатните FMP endpoint-и (biggest-
-# gainers/biggest-losers/most-actives), които вече ползваме за universe.py,
-# НЕ връщат marketCap изобщо. Затова тази проверка сега минава през Finnhub
-# (безплатен tier, FINNHUB_API_KEY) като best-effort вторична проверка - виж
-# universe.py. Ако FINNHUB_API_KEY липсва, тази граница НЕ се прилага реално -
-# разчитаме само на статичния LARGE_CAP_BLOCKLIST + цената като защита.
-MAX_MARKET_CAP_USD = float(os.getenv("MAX_MARKET_CAP_USD", "300000000"))
-# Колко кандидата максимум да проверяваме през Finnhub на едно пълно
-# сканиране (пести безплатния rate limit на Finnhub, ~60 заявки/мин).
-MAX_MOVERS_CANDIDATES = int(os.getenv("MAX_MOVERS_CANDIDATES", "60"))
-# Вдигнато от 5 на 20 по избор на потребителя ("да следи колкото може повече") -
-# технически няма проблем: Alpaca/Finnhub rate limit-ите остават далеч под
-# капацитета им дори при 20 едновременно следени тикера. Реалният брой имейл
-# алърти пак е ограничен от MAX_EMAILS_PER_DAY - по-големият watchlist просто
-# означава повече кандидати се следят/логват, не повече спам.
-WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "20"))
+# BUG HISTORY (18.09, both confirmed live by the user's own Render logs):
+#   Round 1: Twelve Data defaulted to "QQQ" (the Nasdaq-100 ETF). Yahoo
+#     Finance fails very often from Render's cloud IP (same known issue as
+#     gold), so the bot was silently falling back to Twelve Data/QQQ most of
+#     the time - but QQQ's SHARE PRICE (~$718 that day) is on a totally
+#     different scale than the actual Nasdaq-100 index/CFD level (~$29,800,
+#     ~41.5x higher) because of QQQ's 2011 share split. The email showed a
+#     real, correctly-computed signal on a meaningless price scale.
+#   Round 2 (the "fix" for round 1): switched Twelve Data to the index
+#     symbol "NDX" directly, and stooq's fallback to "^ndx" - but BOTH come
+#     back 404 Not Found (confirmed in Render logs - neither symbol exists
+#     on this Twelve Data plan or on stooq's free download endpoint), so
+#     EVERY provider failed for TECH100 and it never checked successfully
+#     at all after that "fix".
+# FIX (this version): go back to the ETF proxies that actually return real
+# data (Twelve Data "QQQ", stooq "qqq.us"), but SCALE their OHLC prices by
+# TECH100_ETF_SCALE before using them - see _try_twelvedata()/the stooq
+# fallback in data_fetch.py. This is mathematically safe for the confluence
+# logic: EMA crossovers, RSI, MACD histogram sign, and Bollinger Band
+# touches are all scale-invariant (multiplying every price by a constant
+# doesn't change any of them), so the BUY/SELL decision is unaffected -
+# only the displayed price/stop-loss/take-profit get put back on the real
+# index scale. The scale factor is an approximation (QQQ/NDX drifts slowly
+# over time due to dividends) - update TECH100_ETF_SCALE in Render
+# periodically if the emailed price visibly diverges from your broker's
+# TECH100 quote. The sanity_min/sanity_max check below still guards against
+# it drifting far enough to matter, or against either symbol ever silently
+# starting to fail again.
+# По заявка (10.10, "старите са за nasdaq 100" - ботът трябваше да е за
+# злато): дефолтите са обърнати обратно - златото (шампионската стратегия)
+# е включено по подразбиране, Tech100 е изключен. Tech100 поддръжката
+# (стария confluence engine) остава изцяло на мястото си - просто сложи
+# ENABLE_TECH100=true в Render, ако го искаш пак (може и двете едновременно).
+ENABLE_TECH100 = _bool("ENABLE_TECH100", False)
+ENABLE_GOLD = _bool("ENABLE_GOLD", True)
+TECH100_TICKER = os.environ.get("TECH100_TICKER", "NQ=F")
+TECH100_TICKER_FALLBACK = os.environ.get("TECH100_TICKER_FALLBACK", "^NDX")
+TECH100_TWELVEDATA_SYMBOL = os.environ.get("TECH100_TWELVEDATA_SYMBOL", "QQQ")
+TECH100_STOOQ_SYMBOL = os.environ.get("TECH100_STOOQ_SYMBOL", "qqq.us")
+# Nasdaq-100 index level / QQQ share price, approx. (confirmed ~41.48 from
+# the user's own screenshot on 18.09 - $29,823.67 CFD vs $718.96 QQQ).
+TECH100_ETF_SCALE = _float("TECH100_ETF_SCALE", 41.5)
 
-# Ботът вече сканира и в pre-market (по избор на потребителя), не само
-# редовна сесия. По подразбиране pre-market започва 4:00 ET (стандартното
-# начало за US борсите) - виж main.py _is_market_hours(). ВНИМАНИЕ: Alpaca
-# безплатният IEX feed има много по-тънки данни през pre-market (виж
-# коментара в main.py) - количеството кандидати може да е по-слабо.
-PREMARKET_START_HOUR = int(os.getenv("PREMARKET_START_HOUR", "4"))
-PREMARKET_START_MINUTE = int(os.getenv("PREMARKET_START_MINUTE", "0"))
+# По заявка (10.10): златото вече НЕ минава през стария continuous
+# confluence engine по-долу (INSTRUMENTS/CHECK_INTERVAL_MINUTES) - то си
+# има собствен, отделен checkpoint-базиран цикъл в app.py, управляван от
+# champion_strategy.py (виж CHAMPION_* по-долу). Този речник се гради
+# ВИНАГИ (независимо от ENABLE_GOLD), за да го ползват champion-цикъла и
+# тестовете - ENABLE_GOLD решава само дали app.py СТАРТИРА този цикъл.
+GOLD_INSTRUMENT = {
+    "key": "GOLD",
+    "name": "злато (XAU/USD, GC=F)",
+    "currency": "$",
+    "yahoo_ticker": GOLD_TICKER,
+    "yahoo_fallback": GOLD_TICKER_FALLBACK,
+    "twelvedata_symbol": GOLD_TWELVEDATA_SYMBOL,
+    "stooq_symbol": GOLD_STOOQ_SYMBOL,
+    "sanity_min": _float("GOLD_SANITY_MIN", 800.0),
+    "sanity_max": _float("GOLD_SANITY_MAX", 8000.0),
+}
 
-# Пълно сканиране на целия universe (нови кандидати) - по-тежко, по-рядко.
-SCAN_INTERVAL_MINUTES = int(os.getenv("SCAN_INTERVAL_MINUTES", "10"))
-# Бърз цикъл - прескорира само вече наблюдаваните 5 тикера, за реално-времеви
-# алърти без да чакаме следващото пълно сканиране.
-FAST_INTERVAL_MINUTES = int(os.getenv("FAST_INTERVAL_MINUTES", "2"))
+# Инструменти на стария continuous confluence engine (CHECK_INTERVAL_MINUTES
+# по-долу) - вече само Tech100 (изключен по подразбиране). Златото НЕ е
+# тук - виж GOLD_INSTRUMENT/CHAMPION_* по-горе/долу.
+INSTRUMENTS = []
+if ENABLE_TECH100:
+    INSTRUMENTS.append({
+        "key": "TECH100",
+        "name": "USA Tech 100 (Nasdaq-100)",
+        "currency": "$",
+        "yahoo_ticker": TECH100_TICKER,
+        "yahoo_fallback": TECH100_TICKER_FALLBACK,
+        "twelvedata_symbol": TECH100_TWELVEDATA_SYMBOL,
+        "twelvedata_scale": TECH100_ETF_SCALE,  # QQQ -> index scale; Yahoo needs no scaling
+        "stooq_symbol": TECH100_STOOQ_SYMBOL,
+        "stooq_scale": TECH100_ETF_SCALE,  # qqq.us -> index scale
+        "sanity_min": _float("TECH100_SANITY_MIN", 8000.0),
+        "sanity_max": _float("TECH100_SANITY_MAX", 60000.0),
+    })
 
-# --- "ЦЕНОВИ СКОК" v2 (01.10, по ТОЧНА спецификация на потребителя - заменя
-# старата по-груба "ОБЕМЕН СКОК" версия отгоре, която гледаше само суров ръст
-# в обема без цена/класация). И ТРИТЕ условия по-долу трябва да са верни
-# ЕДНОВРЕМЕННО, за да изпрати сигнал:
-#   1. Тикерът е в топ PRICE_SPIKE_TOP_N по "dollar volume" (цена x дневен
-#      обем) И dollar volume > PRICE_SPIKE_MIN_DOLLAR_VOLUME.
-#   2. Обемът през ПОСЛЕДНАТА 1 минута >= PRICE_SPIKE_VOLUME_MULTIPLIER пъти
-#      средния обем от предходните PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES минути.
-#   3. Цената е НАГОРЕ >= PRICE_SPIKE_MIN_PRICE_CHANGE_PCT% за последните
-#      PRICE_SPIKE_PRICE_LOOKBACK_MINUTES минути.
-# Никога не пуска поръчка - само следи и известява (виж notifier.py).
+# Candle size used for the indicators. Shorter = faster-reacting but noisier.
+# Yahoo/Twelve Data both support: 5m, 15m, 30m, 60m.
+CANDLE_INTERVAL = os.environ.get("CANDLE_INTERVAL", "15m")
+
+# --- Scan schedule -----------------------------------------------------------
+# How often (minutes) the background loop re-checks the market. Checking
+# much more often than the candle size above just re-reads the same
+# still-forming candle. By user request (24.09): matched to
+# REALERT_COOLDOWN_HOURS (~25 min) so the mental model is simple - check,
+# email if there's a signal, check again ~25 min later, email again if it's
+# still there (or a new one shows up) - instead of checking every 15 min
+# but only being ALLOWED to re-email every 25.
+CHECK_INTERVAL_MINUTES = _int("CHECK_INTERVAL_MINUTES", 25)
+
+# --- Active window -----------------------------------------------------------
+# By user request (18.09): only check/alert Monday-Friday, 07:30-23:00
+# (Europe/Sofia) - no weekend or late-night emails. Outside this window the
+# background loop does nothing (no provider calls, no emails) and just
+# waits for the next tick. Set ACTIVE_DAYS_ONLY=false or widen the hours
+# below (e.g. back to 00:00-23:59) to go back to round-the-clock checking -
+# gold/forex markets do trade nearly 24/5, this window is purely about when
+# YOU want to be alerted, not when the market is open.
+ACTIVE_DAYS_ONLY = _bool("ACTIVE_DAYS_ONLY", True)  # Monday-Friday only
+ACTIVE_HOURS_TZ = os.environ.get("ACTIVE_HOURS_TZ", "Europe/Sofia")
+ACTIVE_START_HOUR = _int("ACTIVE_START_HOUR", 7)
+ACTIVE_START_MINUTE = _int("ACTIVE_START_MINUTE", 30)
+ACTIVE_END_HOUR = _int("ACTIVE_END_HOUR", 23)
+ACTIVE_END_MINUTE = _int("ACTIVE_END_MINUTE", 0)
+
+# --- Шампионска стратегия за злато (quiet_accumulation + ema_trend) ---------
+# намерена и честно валидирана чрез разширен backtest search (GoldBacktest
+# проект - gold_hour_structure_search.py/gold_quiet_accumulation_deepdive.py/
+# gold_combo_oos_check.py, 47 стратегии + комбинации, тествани на ВСИЧКИ 24
+# часа на денонощието): 63.3% win rate на 123 сигнала (пълна ~880-дневна
+# история), out-of-sample 62.9%->64.9% (не деградира), 4 непресичащи се
+# тримесечия 53.8%/69.4%/63.6%/66.7% (нито едно под 50%), random baseline
+# ~47.4%. Виж champion_strategy.py за пълната логика и честните уговорки.
 #
-# ЧЕСТНА БЕЛЕЖКА за данните: топ списъкът (условие 1) се смята от
-# universe.get_volume_snapshot() - дневен кумулативен обем от
-# StockAnalysis.com, не истински market-wide real-time dollar volume (няма
-# безплатен такъв източник) - и е ограничен до вече филтрираните "евтини"
-# тикери на бота (цена <= MAX_UNIVERSE_PRICE, без LARGE_CAP_BLOCKLIST), не
-# буквално целия пазар. 1-минутните свещи (условия 2 и 3) идват от yfinance
-# (безплатен, неофициален/reverse-engineered - виж data_sources.
-# get_minute_bars_batch) - очаквай редки 429 грешки в логовете.
-#
-# ВАЖНО (02.10, намерено след реален инцидент): Render прати "exceeded its
-# memory limit" имейл за този сървис часове след първия деплой на тази
-# функция - yfinance-ският bulk download (pandas DataFrame-и + вътрешни
-# HTTP сесии) на PRICE_SPIKE_TOP_N тикера на всяка минута се оказа твърде
-# тежко за 512MB лимита на Render free tier, натрупвайки памет с времето.
-# Свалени са по подразбиране: интервалът от 1 на 2 мин и топ списъкът от 40
-# на 20 тикера (виж и data_sources.get_minute_bars_batch - вече без threads
-# и с изрично освобождаване на паметта след всяка обиколка). Ако пак видиш
-# "memory limit" имейл, свали ги още (напр. PRICE_SPIKE_TOP_N=10).
-PRICE_SPIKE_ENABLED = _bool("PRICE_SPIKE_ENABLED", True)
-# На колко минути да проверяваме 1-минутните условия (2 и 3).
-PRICE_SPIKE_INTERVAL_MINUTES = int(os.getenv("PRICE_SPIKE_INTERVAL_MINUTES", "2"))
-# На колко минути да опресняваме топ-N списъка по dollar volume (условие 1) -
-# по-рядко от самата проверка, за да пестим StockAnalysis.com заявките.
-PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES = int(os.getenv("PRICE_SPIKE_UNIVERSE_REFRESH_MINUTES", "5"))
-PRICE_SPIKE_TOP_N = int(os.getenv("PRICE_SPIKE_TOP_N", "20"))
-PRICE_SPIKE_MIN_DOLLAR_VOLUME = float(os.getenv("PRICE_SPIKE_MIN_DOLLAR_VOLUME", "2000000"))
-PRICE_SPIKE_VOLUME_MULTIPLIER = float(os.getenv("PRICE_SPIKE_VOLUME_MULTIPLIER", "2"))
-PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES = int(os.getenv("PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES", "5"))
-PRICE_SPIKE_MIN_PRICE_CHANGE_PCT = float(os.getenv("PRICE_SPIKE_MIN_PRICE_CHANGE_PCT", "5"))
-PRICE_SPIKE_PRICE_LOOKBACK_MINUTES = int(os.getenv("PRICE_SPIKE_PRICE_LOOKBACK_MINUTES", "5"))
-# Cooldown - 1 сигнал на тикер на 15 мин, дори да продължава да отговаря на
-# условията (по изрична спецификация на потребителя).
-PRICE_SPIKE_COOLDOWN_MINUTES = int(os.getenv("PRICE_SPIKE_COOLDOWN_MINUTES", "15"))
+# ВАЖНО: валидирано е САМО с проверка в 09:00 Europe/Sofia (24-часов TP/SL
+# хоризонт) - други часове бяха тествани отделно и се представят различно,
+# затова checkpoint-ът по подразбиране сега е само този ЕДИН час на ден
+# (преди - 09:00/16:30/23:00, за старата quiet_accumulation+session_momentum
+# комбинация). Смени CHAMPION_CHECKPOINTS, ако искаш да добавиш други часове,
+# но имай предвид, че само 09:00 е честно backtest-ван с тази комбинация.
+def _parse_checkpoints(raw: str):
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            h, m = part.split(":")
+            out.append((int(h), int(m)))
+        except ValueError:
+            continue
+    return out or [(9, 0)]
 
-# --- Telegram известия (01.10, по избор на потребителя - "ЦЕНОВИ СКОК"
-# сигналите да идват в Telegram, не email, за по-бързо известяване на
-# телефона). Безплатно - виж README.md за стъпките през @BotFather. Ако не е
-# конфигуриран, send_price_spike_alert() пада обратно на email (ако e
-# включен) вместо да изгуби сигнала напълно. ---
-TELEGRAM_ENABLED = _bool("TELEGRAM_ENABLED", False)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# --- Защита срещу "купуване на върха" (същия проблем, докладван при
-# memecoin бота на 17.09 - алърт точно на върха на кратък spike, цената
-# пада веднага след получаване на имейла). Изисква score-ът да е над
-# прага при поне MIN_HIGH_POTENTIAL_CONFIRMATIONS последователни проверки
-# (fast check на всеки FAST_INTERVAL_MINUTES) - не само на самия първи
-# spike - и че цената не е вече паднала над PEAK_DRAWDOWN_STOP_PCT% от
-# най-високата видяна цена, откакто следим тикера. ---
-MIN_HIGH_POTENTIAL_CONFIRMATIONS = int(os.getenv("MIN_HIGH_POTENTIAL_CONFIRMATIONS", "2"))
-PEAK_DRAWDOWN_STOP_PCT = float(os.getenv("PEAK_DRAWDOWN_STOP_PCT", "5"))
+CHAMPION_CHECKPOINTS = _parse_checkpoints(os.environ.get("CHAMPION_CHECKPOINTS", "09:00"))
+CHAMPION_CHECKPOINTS_TZ = os.environ.get("CHAMPION_CHECKPOINTS_TZ", ACTIVE_HOURS_TZ)
 
-# --- Позициониране (само за информативния текст в алъртите - не изпълнява поръчки) ---
-POSITION_SIZE_EUR = float(os.getenv("POSITION_SIZE_EUR", "20"))
-TARGET_PROFIT_EUR = float(os.getenv("TARGET_PROFIT_EUR", "5"))
-# Защита срещу ZeroDivisionError при POSITION_SIZE_EUR=0 (намерено при
-# цялостен преглед на кода, 18.09) - това е само информативен % за текста в
-# алъртите, не истинско изпълнение на поръчки, затова при 0 просто пада
-# обратно на 0% вместо да гръмне цялото стартиране на бота.
-TARGET_PROFIT_PCT = (TARGET_PROFIT_EUR / POSITION_SIZE_EUR) if POSITION_SIZE_EUR else 0.0  # 0.25 по подразбиране
+# 1:1 ATR risk:reward (Рунд 2 от backtest-а, по твое желание - "не искам tp
+# да е нещо грандиозно"). Промяната тук НЕ преизчислява backtest резултата
+# по-горе - те са валидирани точно с 1.5/1.5, не променяй без нов backtest.
+CHAMPION_STOP_ATR_MULT = _float("CHAMPION_STOP_ATR_MULT", 1.5)
+CHAMPION_TP_ATR_MULT = _float("CHAMPION_TP_ATR_MULT", 1.5)
 
-# --- Email алърти ---
-ALERT_EMAIL_ENABLED = _bool("ALERT_EMAIL_ENABLED", False)
-# --- Resend (https://resend.com) - изпраща email през HTTP API, не през Gmail SMTP.
-# Ползваме го вместо Gmail App Password, защото Family Link/supervised Google
-# акаунти не позволяват App Passwords изобщо. Виж README.md за регистрация.
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-RESEND_FROM_EMAIL = os.getenv("RESEND_FROM_EMAIL", "onboarding@resend.dev")
-ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "yani.kolev2011@gmail.com")
+# Шампионската стратегия е валидирана точно на 1-часови (GC=F) свещи - не
+# сменяй това, без да пуснеш нов backtest на новия timeframe. Периодът на
+# изтегляне (60 дни) дава ~1000+ часови свещи - достатъчно за 100-свещния
+# ATR прозорец на quiet_accumulation плюс буфер история.
+GOLD_CANDLE_INTERVAL = os.environ.get("GOLD_CANDLE_INTERVAL", "60m")
+GOLD_FETCH_PERIOD = os.environ.get("GOLD_FETCH_PERIOD", "60d")
 
-# --- Anti-spam защита за Resend дневната квота (безплатен tier = 100 имейла/ден
-# за целия акаунт, споделен с другите ботове, ползващи същия RESEND_API_KEY) ---
-# Не пращаме имейл по-често от веднъж на MIN_EMAIL_INTERVAL_SECONDS (420с =
-# 7 мин, по избор на потребителя от 17.09 - "по 1 койн на всеки 7-8 минути"),
-# плюс твърд дневен таван като резерва под истинския лимит на Resend.
-# Алъртът винаги се вижда в Render Logs - само самото email изпращане се
-# прескача, ако сме над темпото.
-MIN_EMAIL_INTERVAL_SECONDS = int(os.getenv("MIN_EMAIL_INTERVAL_SECONDS", "420"))
-# Дневната квота (100 общо за акаунта) е разпределена 70/30 между двата бота
-# по избор на потребителя (18.09: "70 memecoins 30 pennystocks") - memecoin
-# ботът държи 70, тук 30 (вдигнато от 10).
-MAX_EMAILS_PER_DAY = int(os.getenv("MAX_EMAILS_PER_DAY", "30"))
+# --- Confluence strategy -----------------------------------------------------
+# Number of the 7 confluence conditions (see signals.py, candlesticks.py,
+# analog_matcher.py) that must agree before an alert is sent. Higher =
+# fewer, higher-conviction alerts; lower = more alerts/noisier.
+CONFLUENCE_THRESHOLD = _int("CONFLUENCE_THRESHOLD", 3)
 
-# --- "Тихи часове" за имейл алъртите - потребителят иска имейли САМО между
-# 07:30 и 23:00 местно време (не иска да го буди бот през нощта). Прилага се
-# само върху ИЗПРАЩАНЕТО на email - алъртите пак се логват в Render Logs
-# денонощно. Извън тези часове main.py и без друго не сканира (пазарът е
-# затворен), но границата тук е допълнителна защита + важи за всеки edge
-# case (напр. ръчно повикан /test-email по всяко време на денонощието). ---
-ALERT_QUIET_HOURS_TZ = os.getenv("ALERT_QUIET_HOURS_TZ", "Europe/Sofia")
-ALERT_ACTIVE_START_HOUR = int(os.getenv("ALERT_ACTIVE_START_HOUR", "7"))
-ALERT_ACTIVE_START_MINUTE = int(os.getenv("ALERT_ACTIVE_START_MINUTE", "30"))
-ALERT_ACTIVE_END_HOUR = int(os.getenv("ALERT_ACTIVE_END_HOUR", "23"))
-ALERT_ACTIVE_END_MINUTE = int(os.getenv("ALERT_ACTIVE_END_MINUTE", "0"))
+# --- Analog / historical pattern matching (see analog_matcher.py) ----------
+# By user request (24.09): "look at the last 1-2 days for a similar setup,
+# see what happened, and use that for realistic (not crazy) TP/SL levels."
+# ANALOG_SHAPE_CANDLES: length of the recent "shape" being matched (10 x
+# 15m = ~2.5h of price action).
+# ANALOG_LOOKBACK_CANDLES: how far back to search for a similar shape (192 x
+# 15m = ~2 days of near-continuous trading).
+# ANALOG_FOLLOW_CANDLES: how many candles after a historical match to look
+# at to see what actually happened (8 x 15m = ~2h of follow-through).
+# ANALOG_MAX_DISTANCE: max allowed shape-match distance for a match to be
+# trusted at all - a poor match is ignored rather than forced into a signal
+# or used for sizing. Shapes are compared z-score-normalized (each window
+# rescaled to its own mean=0/std=1 before comparing), so this distance is in
+# standard-deviation units, not price or %: 0 = identical shape, larger =
+# less alike. Deliberately strict (checked empirically against pure random
+# walks searched over ANALOG_LOOKBACK_CANDLES candidates: <1% of the time
+# does random noise alone produce a match this close) - the point of this
+# feature is a trustworthy, real-outcome-based TP/SL, so a "maybe" match is
+# skipped rather than risking a wrong one; it just won't vote/size every
+# check, only when something genuinely similar shows up.
+ANALOG_SHAPE_CANDLES = _int("ANALOG_SHAPE_CANDLES", 10)
+ANALOG_LOOKBACK_CANDLES = _int("ANALOG_LOOKBACK_CANDLES", 192)
+ANALOG_FOLLOW_CANDLES = _int("ANALOG_FOLLOW_CANDLES", 8)
+ANALOG_MAX_DISTANCE = _float("ANALOG_MAX_DISTANCE", 0.18)
 
-# --- Render (или локален) HTTP порт за health-check ---
-PORT = int(os.getenv("PORT", "10000"))
+# By user request (25.09 - "искам наистина да гледа графиката от предните
+# 1-2 дена и по-реалистични take profit-и"): take-profit/stop-loss should
+# reflect what ACTUALLY happened after a similar recent setup far more
+# often than they currently do. ANALOG_MAX_DISTANCE above is deliberately
+# strict (see its comment) because it also gates the 7th CONFLUENCE VOTE -
+# a shaky match shouldn't be able to help trigger a BUY/SELL email on its
+# own. But that strictness was tested (simulated on realistic-noise 15m
+# data) to only produce a "confident" match on ~9% of checks - so 91% of
+# the time, TP/SL was silently falling back to the generic ATR multiple
+# below instead of the real-history-based sizing this feature exists for.
+# This separate, looser threshold is used ONLY for sizing, never for the
+# confluence vote - a so-so shape match is still useful for "roughly how
+# far did this kind of move tend to run", even when it's not solid enough
+# to trust as a signal on its own. Loosening only this (not
+# ANALOG_MAX_DISTANCE) means TP/SL now reflects a real recent analog on
+# roughly a quarter of checks instead of ~1 in 11, without changing which
+# checks actually trigger a BUY/SELL email.
+ANALOG_SIZING_MAX_DISTANCE = _float("ANALOG_SIZING_MAX_DISTANCE", 0.35)
 
-# --- Self-ping (keep-alive) ---
-# Виж коментара в main.py::_self_ping_loop / MemecoinScanner/config.py за
-# пълния контекст (18.09). 5 минути = 3x резерва спрямо 15-те минути праг,
-# на който Render безплатният план приспива service-а без входящ трафик.
-KEEP_ALIVE_PING_MINUTES = int(os.getenv("KEEP_ALIVE_PING_MINUTES", "5"))
+# By user request (18.09): only email BUY signals, never SELL - later
+# reverted (24.09): with BUY-only, the inbox always looks the same
+# regardless of what the market actually does, which is hard to tell apart
+# from the bot being stuck/broken. Now both directions are emailed by
+# default, so what you see genuinely reflects the confluence logic - BUY,
+# SELL, or quiet, whichever the market actually shows. SELL signals are
+# always computed and logged/visible on "/" either way. Set
+# ALERT_ONLY_BUY=true in Render if you want to go back to BUY-only.
+ALERT_ONLY_BUY = _bool("ALERT_ONLY_BUY", False)
 
-# --- Sanity-check защита срещу грешна/нереална "днешна" цена (13.10, по
-# реален инцидент - CLWT алърт показа "Цена: $2.15", докато потребителят
-# твърди, че реалната цена не е минавала над ~$1.56 около това време -
-# виж data_sources.get_last_regular_session_price / main.py::
-# _price_is_sane за пълния технически контекст). "Днешният" ред от
-# get_bars_yfinance(interval="1d", prepost=True) е ОЩЕ недовършена свещ,
-# докато пазарът е отворен - при силно неликвиден penny stock единичен
-# грешен/нереален принт може временно да изглежда като "последна цена" и
-# дори да задейства donchian сигнала фалшиво. Затова, САМО за кандидати,
-# които иначе биха пратили "ВИСОК ПОТЕНЦИАЛ" алърт, правим бърза
-# допълнителна 1-минутна (редовна сесия) проверка - ако разминаването е
-# над прага, пропускаме алърта ТОЗИ цикъл (не завинаги - следващият бърз
-# цикъл проверява пак със свежи данни, същия принцип като anti-spam
-# retry-логиката в notifier.can_send_now).
-PRICE_SANITY_CHECK_ENABLED = _bool("PRICE_SANITY_CHECK_ENABLED", True)
-PRICE_SANITY_CHECK_MAX_DEVIATION_PCT = float(os.getenv("PRICE_SANITY_CHECK_MAX_DEVIATION_PCT", "12"))
+EMA_FAST = _int("EMA_FAST", 9)
+EMA_MID = _int("EMA_MID", 21)
+EMA_SLOW = _int("EMA_SLOW", 50)
+RSI_PERIOD = _int("RSI_PERIOD", 14)
+RSI_OVERSOLD = _float("RSI_OVERSOLD", 35)
+RSI_OVERBOUGHT = _float("RSI_OVERBOUGHT", 65)
+MACD_FAST = _int("MACD_FAST", 12)
+MACD_SLOW = _int("MACD_SLOW", 26)
+MACD_SIGNAL = _int("MACD_SIGNAL", 9)
+BB_PERIOD = _int("BB_PERIOD", 20)
+BB_STD = _float("BB_STD", 2.0)
+ATR_PERIOD = _int("ATR_PERIOD", 14)
 
-# --- Трайна памет отвъд Render локалния диск (по избор) ---
-# Виж коментара в watchlist.py::load_watchlist за пълния контекст (18.09,
-# по оплакване за повторни email-и след всеки push/redeploy). Ако зададени -
-# watchlist-ът се пази в безплатен Upstash Redis (upstash.com) вместо на
-# локалния Render диск, който се изтрива при всеки redeploy. Взимат се от
-# Upstash dashboard -> базата -> таб "REST API". Ако останат празни - ботът
-# продължава по старому с локален файл (работи си, просто не оцелява
-# redeploy). Може да се ползва СЪЩАТА Upstash база и за MemecoinScanner -
-# ключовете са различни ("pennystockscanner:watchlist" vs
-# "memecoinscanner:seen"), не се бъркат.
-UPSTASH_REDIS_REST_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_REDIS_REST_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+# Only re-alert on the SAME signal type after this many hours have passed,
+# even if the confluence score stays above the threshold on every check.
+# By user request (24.09, raised from ~10 min): with the active window
+# (07:30-23:00 Mon-Fri = ~930 min/day) and a 15-min check interval, a
+# 10-minute cooldown could in the worst case (one direction holding all
+# day) approach ~93 emails/day - uncomfortably close to Resend's free-tier
+# cap of 100 emails/day. 25 minutes brings that worst case down to ~37/day,
+# a much safer margin.
+REALERT_COOLDOWN_HOURS = _float("REALERT_COOLDOWN_HOURS", 25 / 60)  # ~25 minutes
 
-# --- Файлове ---
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
+# By user request (24.09): "ако потенциал за short/long e по-висок, да
+# даде повече време да хитне take profit-a" - a high-conviction signal
+# (score >= STRONG_SIGNAL_SCORE_THRESHOLD out of 7) usually implies a
+# further take-profit target (see the analog-based sizing in signals.py -
+# a stronger/more confident analog match tends to carry a bigger realized
+# move), so re-alerting on it again after only the normal ~25 min is often
+# premature - the trade hasn't had time to develop toward that target yet.
+# After sending a signal whose score met this threshold, the NEXT alert for
+# that same direction waits STRONG_SIGNAL_COOLDOWN_HOURS (~35 min) instead
+# of the usual REALERT_COOLDOWN_HOURS. A normal-strength signal (below the
+# threshold) keeps the usual cooldown - see _should_send() in app.py.
+STRONG_SIGNAL_SCORE_THRESHOLD = _int("STRONG_SIGNAL_SCORE_THRESHOLD", 5)
+STRONG_SIGNAL_COOLDOWN_HOURS = _float("STRONG_SIGNAL_COOLDOWN_HOURS", 35 / 60)  # ~35 minutes
+
+# --- Email (Resend API) ------------------------------------------------------
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+# Resend's shared sandbox sender domain is "resend.dev" (not "resend.com" -
+# that one requires your own verified domain and will 403). Works without
+# verifying your own domain, but Resend will only actually deliver to the
+# email address tied to your Resend account until you verify a domain at
+# resend.com/domains.
+ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", "GoldSignalBot <onboarding@resend.dev>")
+ALERT_EMAIL = os.environ.get("ALERT_EMAIL", "yani.kolev2011@gmail.com")
+
+# --- Web server ---------------------------------------------------------
+PORT = _int("PORT", 10000)
+
+# Send a one-off test email at startup so you know delivery works.
+SEND_TEST_EMAIL_ON_START = _bool("SEND_TEST_EMAIL_ON_START", False)
