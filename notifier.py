@@ -1,218 +1,242 @@
 """
-Изпраща алърти - email (Resend HTTP API) и по избор Telegram.
+Изпращане на алърти. Три канала:
+  - лог (винаги, вижда се в Render "Logs" таба)
+  - email през Resend (https://resend.com) - HTTP API, само ако
+    ALERT_EMAIL_ENABLED=true и RESEND_API_KEY е попълнен.
+  - Telegram (01.10) - само за "ЦЕНОВИ СКОК" сигналите (виж
+    send_price_spike_alert), само ако TELEGRAM_ENABLED=true и
+    TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID са попълнени - виж README.md.
 
-ВЪЗСТАНОВЕН (13.10) след случайно презаписване с notifier.py от друг
-проект (GoldSignalBot), качен по грешка през GitHub "Upload files" в това
-repo - старата версия на този файл НЕ беше запазена никъде извлечимо,
-затова е пресъздадена от нулата, точно по сигнатурите и начина на употреба,
-които main.py реално вика (send_alert(label, result), send_price_spike_
-alert(symbol, price_now, price_change_pct, last_minute_volume,
-avg_prior_volume, dollar_volume), send_telegram_message(text)) - виж
-main.py за пълния контекст. Честно: ако оригиналният email HTML дизайн е
-изглеждал различно (цветове, точен текст), това тук е РЕКОНСТРУКЦИЯ, не
-byte-perfect възстановяване - но поведението (throttle, тихи часове,
-кои данни влизат в писмото) би трябвало да съвпада с документираното в
-config.py/main.py.
+Забележка: НЕ ползваме Gmail SMTP/App Password, защото Google не позволява
+App Passwords на Family Link (supervised) акаунти. Resend е безплатна услуга,
+праща email през обикновен HTTP POST с API ключ - виж README.md за стъпките.
 """
 import logging
-import threading
-from datetime import datetime, timedelta, timezone
-
-import requests
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import requests
+
 import config
+from scoring import ScoreResult
 
 log = logging.getLogger("notifier")
 
-RESEND_URL = "https://api.resend.com/emails"
-TELEGRAM_URL_TMPL = "https://api.telegram.org/bot{token}/sendMessage"
-
-# --- Anti-spam състояние (виж config.MIN_EMAIL_INTERVAL_SECONDS/
-# MAX_EMAILS_PER_DAY/ALERT_QUIET_HOURS_TZ) - нарочно само в паметта на
-# процеса (нулира се при redeploy/restart), споделено между send_alert и
-# send_price_spike_alert (и двете броят към същата дневна Resend квота) -
-# защитено с lock, защото fast/full/price-spike циклите тичат в отделни нишки.
-_lock = threading.Lock()
-_last_email_at: datetime = None
-_emails_sent_today = 0
-_emails_sent_date = None  # date() на последното нулиране на дневния брояч
+RESEND_API_URL = "https://api.resend.com/emails"
 
 
-def _in_active_window(now_utc: datetime) -> bool:
+def _within_active_hours() -> bool:
+    """Проверява дали текущият момент е в разрешения прозорец за имейли
+    (config.ALERT_ACTIVE_START_* / ALERT_ACTIVE_END_* в ALERT_QUIET_HOURS_TZ).
+    Ако timezone данните липсват по някаква причина - НЕ блокираме (по-добре
+    да получиш имейл в грешен час, отколкото да мълчим заради bug)."""
     try:
         tz = ZoneInfo(config.ALERT_QUIET_HOURS_TZ)
-    except Exception:
-        tz = timezone.utc
-    local = now_utc.astimezone(tz)
-    start = local.replace(hour=config.ALERT_ACTIVE_START_HOUR, minute=config.ALERT_ACTIVE_START_MINUTE,
-                           second=0, microsecond=0)
-    end = local.replace(hour=config.ALERT_ACTIVE_END_HOUR, minute=config.ALERT_ACTIVE_END_MINUTE,
-                         second=0, microsecond=0)
-    return start <= local <= end
+    except Exception as e:
+        log.warning("ALERT_QUIET_HOURS_TZ (%s) невалиден: %s - пропускам проверката за часове.", config.ALERT_QUIET_HOURS_TZ, e)
+        return True
+    now_local = datetime.now(tz)
+    start = now_local.replace(hour=config.ALERT_ACTIVE_START_HOUR, minute=config.ALERT_ACTIVE_START_MINUTE, second=0, microsecond=0)
+    end = now_local.replace(hour=config.ALERT_ACTIVE_END_HOUR, minute=config.ALERT_ACTIVE_END_MINUTE, second=0, microsecond=0)
+    return start <= now_local <= end
+
+# --- Anti-spam темпо-ограничител за Resend (виж config.MIN_EMAIL_INTERVAL_SECONDS /
+# MAX_EMAILS_PER_DAY) - пази в паметта на процеса, реду се при restart на Render,
+# но това е ок - целта е само да не гърмим много имейли наведнъж при серия алърти. ---
+_last_sent_at = None
+_daily_count = 0
+_daily_reset_date = None
 
 
-def _throttle_allows_send() -> bool:
-    """True, ако темпото (мин. интервал + дневен таван + тихи часове)
-    позволява изпращане ТОЧНО СЕГА - и ако да, вдига брояча/timestamp-а
-    веднага (под lock), за да не се "надпреварват" паралелни извиквания."""
-    global _last_email_at, _emails_sent_today, _emails_sent_date
+def _rate_limit_ok() -> bool:
+    global _last_sent_at, _daily_count, _daily_reset_date
     now = datetime.now(timezone.utc)
-    with _lock:
-        if not _in_active_window(now):
-            log.info("Email пропуснат - извън активните часове (%s, %02d:%02d-%02d:%02d %s).",
-                      now.isoformat(), config.ALERT_ACTIVE_START_HOUR, config.ALERT_ACTIVE_START_MINUTE,
-                      config.ALERT_ACTIVE_END_HOUR, config.ALERT_ACTIVE_END_MINUTE, config.ALERT_QUIET_HOURS_TZ)
+    today = now.date()
+
+    if _daily_reset_date != today:
+        _daily_reset_date = today
+        _daily_count = 0
+
+    if _daily_count >= config.MAX_EMAILS_PER_DAY:
+        log.warning(
+            "Дневният лимит от %d имейла е достигнат - пропускам email-а (алъртът е в логовете).",
+            config.MAX_EMAILS_PER_DAY,
+        )
+        return False
+
+    if _last_sent_at is not None:
+        elapsed = (now - _last_sent_at).total_seconds()
+        if elapsed < config.MIN_EMAIL_INTERVAL_SECONDS:
+            log.info(
+                "Прескачам email (анти-спам темпо) - оставащи %.0fс до следващия разрешен имейл.",
+                config.MIN_EMAIL_INTERVAL_SECONDS - elapsed,
+            )
             return False
 
-        today = now.date()
-        if _emails_sent_date != today:
-            _emails_sent_date = today
-            _emails_sent_today = 0
-
-        if _emails_sent_today >= config.MAX_EMAILS_PER_DAY:
-            log.info("Email пропуснат - дневният таван (%d) е достигнат.", config.MAX_EMAILS_PER_DAY)
-            return False
-
-        if _last_email_at is not None:
-            elapsed = (now - _last_email_at).total_seconds()
-            if elapsed < config.MIN_EMAIL_INTERVAL_SECONDS:
-                log.info("Email пропуснат - минималният интервал (%ds) не е минал още (%.0fs).",
-                          config.MIN_EMAIL_INTERVAL_SECONDS, elapsed)
-                return False
-
-        _last_email_at = now
-        _emails_sent_today += 1
-        return True
+    return True
 
 
-def _send_email(subject: str, html: str) -> bool:
+def _mark_email_sent():
+    global _last_sent_at, _daily_count
+    _last_sent_at = datetime.now(timezone.utc)
+    _daily_count += 1
+
+
+def format_alert(kind: str, result: ScoreResult) -> str:
+    """ПОПРАВКА (13.10, по реален инцидент - потребителят получи email с
+    "Цена: $2.1500000953674316" за CLWT вместо $2.15): цената идва като
+    numpy/pandas float (често float32 отвътре в yfinance/pandas данните),
+    който при директно вмъкване в f-string показва пълната двоична
+    апроксимация, не закръгленото число. Преди тук НЯМАШЕ форматиране
+    изобщо (само `${result.raw.get('price')}`) - сега закръгля до 4
+    знака след десетичната точка (достатъчно за penny stock цени под
+    $5, виж config.py), и пази "N/A" ако цената липсва."""
+    target_pct = round(config.TARGET_PROFIT_PCT * 100)
+    _price = result.raw.get('price')
+    _price_str = f"{_price:.4f}" if isinstance(_price, (int, float)) else "N/A"
+    lines = [
+        f"[{kind}] {result.symbol} — score {result.score}/100",
+        f"Цена: ${_price_str}",
+        f"Потенциал: ~{target_pct}% return "
+        f"(позиция {config.POSITION_SIZE_EUR}€ -> цел {config.TARGET_PROFIT_EUR}€)",
+        "Причини: " + "; ".join(result.reasons) if result.reasons else "",
+    ]
+    return "\n".join(l for l in lines if l)
+
+
+def can_send_now() -> bool:
+    """Pure "peek" - True ако email, пратен точно СЕГА, НЕ би бил пропуснат
+    заради anti-spam темпото (MIN_EMAIL_INTERVAL_SECONDS/MAX_EMAILS_PER_DAY).
+    main.py я ползва, за да НЕ маркира тикер като "вече алъртнат", когато
+    реално email-ът е бил пропуснат заради темпото - виж коментара в
+    main.py::_maybe_alert_high_potential (18.09)."""
+    return _rate_limit_ok()
+
+
+def send_alert(kind: str, result: ScoreResult) -> bool:
+    """Връща True ако е "обработено" (пратен успешно, ИЛИ email-ите са
+    изключени/не са конфигурирани, ИЛИ извън разрешените часове - retry не
+    би помогнал), False САМО ако е пропуснат чисто заради anti-spam темпото."""
+    message = format_alert(kind, result)
+    log.info("ALERT:\n%s", message)
+
     if not config.ALERT_EMAIL_ENABLED:
-        log.info("Email пропуснат - ALERT_EMAIL_ENABLED=false.")
-        return False
-    if not config.RESEND_API_KEY:
-        log.error("RESEND_API_KEY не е зададен - не мога да изпратя email.")
-        return False
-
-    payload = {
-        "from": f"Penny Stock Scanner <{config.RESEND_FROM_EMAIL}>",
-        "to": [config.ALERT_EMAIL_TO],
-        "subject": subject,
-        "html": html,
-    }
-    headers = {"Authorization": f"Bearer {config.RESEND_API_KEY}"}
-    try:
-        resp = requests.post(RESEND_URL, json=payload, headers=headers, timeout=20)
-        if resp.status_code >= 300:
-            log.error("Resend API грешка %s: %s", resp.status_code, resp.text)
-            return False
-        resend_id = None
-        try:
-            resend_id = resp.json().get("id")
-        except Exception:  # noqa: BLE001
-            pass
-        log.info("Email приет от Resend: %s (id=%s, to=%s)", subject, resend_id, config.ALERT_EMAIL_TO)
         return True
-    except Exception as exc:  # noqa: BLE001
-        log.error("Грешка при изпращане на email през Resend: %s", exc)
-        return False
+    return _send_email(subject=f"[Penny Stock Scanner] {result.symbol} - {kind}", body=message)
 
 
-def send_alert(label: str, result) -> bool:
-    """Алърт за "ВИСОК ПОТЕНЦИАЛ" (или watchlist) от основния confluence
-    score (виж scoring.py::ScoreResult). Връща True само ако email-ът
-    РЕАЛНО е изпратен - False при throttle (тихи часове/темпо/дневен
-    таван) ИЛИ при грешка - main.py пробва пак на следващия цикъл и в
-    двата случая."""
-    price = (result.raw or {}).get("price") if getattr(result, "raw", None) else None
-    reasons_html = "".join(f"<li>{r}</li>" for r in result.reasons)
-    price_part = f" @ ${price:,.4f}" if price else ""
-
-    position_note = ""
-    if price and config.POSITION_SIZE_EUR:
-        shares_note = f"{config.POSITION_SIZE_EUR:.0f}€ позиция, цел {config.TARGET_PROFIT_EUR:.0f}€ (~{config.TARGET_PROFIT_PCT * 100:.0f}%)"
-        position_note = f'<p style="font-size:12px; color:#888; margin:-6px 0 14px;">{shares_note} - само информативно, ботът не изпълнява поръчки.</p>'
-
-    catalyst_line = "Да" if result.has_catalyst else "Не"
-    dilution_line = "⚠️ ДА - скорошен dilution filing" if getattr(result, "has_dilution_risk", False) else "Не"
-
-    subject = f"🚀 {label}: {result.symbol}{price_part}"
-    html = f"""
-    <div style="font-family: -apple-system, Arial, sans-serif; max-width: 560px; margin: 0 auto;">
-      <div style="background:#e8f5e9; color:#1b5e20; padding:16px 20px; border-radius:10px 10px 0 0;">
-        <h2 style="margin:0; font-size:20px;">🚀 {result.symbol}: {label}</h2>
-        <p style="margin:4px 0 0; font-size:14px;">Score: {result.score:.0f}/100</p>
-      </div>
-      <div style="border:1px solid #eee; border-top:none; padding:20px; border-radius:0 0 10px 10px;">
-        <table style="width:100%; border-collapse:collapse; font-size:14px; margin-bottom:10px;">
-          <tr><td style="padding:4px 0; color:#666;">Цена</td><td style="text-align:right; font-weight:600;">{f"${price:,.4f}" if price else "-"}</td></tr>
-          <tr><td style="padding:4px 0; color:#666;">Новина/catalyst</td><td style="text-align:right;">{catalyst_line}</td></tr>
-          <tr><td style="padding:4px 0; color:#666;">Dilution риск</td><td style="text-align:right;">{dilution_line}</td></tr>
-        </table>
-        {position_note}
-        <p style="font-size:14px; color:#333; margin-bottom:6px;"><strong>Защо:</strong></p>
-        <ul style="font-size:13px; color:#444; margin-top:0; padding-left:18px;">{reasons_html}</ul>
-        <p style="font-size:11px; color:#999; margin-top:18px; border-top:1px solid #eee; padding-top:10px;">
-          Автоматичен сигнал от technical screening (виж scoring.py/strategies.py за честния backtest зад него).
-          Не е финансов съвет - провери сам преди да отвориш позиция.
-        </p>
-      </div>
-    </div>
-    """
-    if not _throttle_allows_send():
-        return False
-    return _send_email(subject, html)
-
-
-def send_price_spike_alert(symbol: str, price_now: float, price_change_pct: float,
-                            last_minute_volume: float, avg_prior_volume: float, dollar_volume: float) -> bool:
-    """"Ценови скок" v2 алърт (виж main.py::run_price_spike_scan за точната
-    спецификация - условие 2+3 вече е проверено ПРЕДИ това извикване).
-    Връща True само ако email-ът РЕАЛНО е изпратен."""
-    vol_ratio = (last_minute_volume / avg_prior_volume) if avg_prior_volume else 0.0
-    subject = f"⚡ Ценови скок: {symbol} @ ${price_now:,.4f} ({price_change_pct:+.1f}%)"
-    html = f"""
-    <div style="font-family: -apple-system, Arial, sans-serif; max-width: 560px; margin: 0 auto;">
-      <div style="background:#fff3e0; color:#e65100; padding:16px 20px; border-radius:10px 10px 0 0;">
-        <h2 style="margin:0; font-size:20px;">⚡ {symbol}: Ценови скок</h2>
-        <p style="margin:4px 0 0; font-size:14px;">Рязко движение, засечено в реално време</p>
-      </div>
-      <div style="border:1px solid #eee; border-top:none; padding:20px; border-radius:0 0 10px 10px;">
-        <table style="width:100%; border-collapse:collapse; font-size:14px; margin-bottom:16px;">
-          <tr><td style="padding:4px 0; color:#666;">Цена сега</td><td style="text-align:right; font-weight:600;">${price_now:,.4f}</td></tr>
-          <tr><td style="padding:4px 0; color:#666;">Промяна в цената</td><td style="text-align:right;">{price_change_pct:+.1f}%</td></tr>
-          <tr><td style="padding:4px 0; color:#666;">Обем (последна мин.)</td><td style="text-align:right;">{last_minute_volume:,.0f}</td></tr>
-          <tr><td style="padding:4px 0; color:#666;">Среден обем (база)</td><td style="text-align:right;">{avg_prior_volume:,.0f} ({vol_ratio:.1f}x)</td></tr>
-          <tr><td style="padding:4px 0; color:#666;">Dollar volume</td><td style="text-align:right;">${dollar_volume:,.0f}</td></tr>
-        </table>
-        <p style="font-size:11px; color:#999; margin-top:18px; border-top:1px solid #eee; padding-top:10px;">
-          Условия (виж config.PRICE_SPIKE_*): обем >= {config.PRICE_SPIKE_VOLUME_MULTIPLIER}x средното за последните
-          {config.PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES} мин, цена >= {config.PRICE_SPIKE_MIN_PRICE_CHANGE_PCT}% нагоре за
-          последните {config.PRICE_SPIKE_PRICE_LOOKBACK_MINUTES} мин. Не е финансов съвет - провери сам.
-        </p>
-      </div>
-    </div>
-    """
-    if not _throttle_allows_send():
-        return False
-    return _send_email(subject, html)
+TELEGRAM_API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
 
 def send_telegram_message(text: str) -> bool:
-    if not config.TELEGRAM_ENABLED:
-        log.info("Telegram пропуснато - TELEGRAM_ENABLED=false.")
+    """Праща съобщение през Telegram Bot API - прост HTTP POST, без
+    допълнителна библиотека (01.10, виж README.md за стъпките да си
+    направиш бот през @BotFather и да вземеш chat_id-то си). Връща True само
+    при реално успешно изпратено съобщение - False ако Telegram не е
+    конфигуриран/включен, или заявката се провали (извикващият код тогава
+    решава дали да пробва email fallback - виж send_price_spike_alert)."""
+    if not (config.TELEGRAM_ENABLED and config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
         return False
-    if not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID):
-        log.error("TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID липсват - не мога да изпратя Telegram съобщение.")
-        return False
-    url = TELEGRAM_URL_TMPL.format(token=config.TELEGRAM_BOT_TOKEN)
     try:
-        resp = requests.post(url, json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+        resp = requests.post(
+            TELEGRAM_API_URL.format(token=config.TELEGRAM_BOT_TOKEN),
+            json={"chat_id": config.TELEGRAM_CHAT_ID, "text": text},
+            timeout=15,
+        )
         if resp.status_code >= 300:
-            log.error("Telegram API грешка %s: %s", resp.status_code, resp.text)
+            log.error("Telegram отказа изпращането (%s): %s", resp.status_code, resp.text)
             return False
-        log.info("Telegram съобщение изпратено.")
+        log.info("Telegram алърт изпратен успешно.")
         return True
-    except Exception as exc:  # noqa: BLE001
-        log.error("Грешка при изпращане на Telegram съобщение: %s", exc)
+    except Exception as e:
+        log.error("Изпращането през Telegram се провали: %s", e)
         return False
+
+
+def send_price_spike_alert(symbol: str, price, price_change_pct, last_minute_volume, avg_prior_volume, dollar_volume) -> bool:
+    """"ЦЕНОВИ СКОК" сигнал (01.10, по ТОЧНА спецификация на потребителя -
+    заменя старата send_volume_surge_alert). Условията (топ-N по dollar
+    volume + обем последна минута >= Nx средния + цена нагоре >= X% за N мин)
+    вече са проверени в main.py::run_price_spike_scan ПРЕДИ да се стигне
+    дотук - тук само форматираме и пращаме.
+
+    Канал: Telegram (config.TELEGRAM_*) - по избор на потребителя, за
+    по-бързо известяване на телефона, вместо email. Ако Telegram не е
+    конфигуриран/се провали, пада обратно на email (ако е включен) - по-добре
+    закъснял email, отколкото напълно изгубен сигнал.
+
+    НИКОГА не пуска поръчка - само наблюдава и известява, потребителят решава
+    сам дали и как да влезе (виж README.md)."""
+    message = (
+        f"🚀 ЦЕНОВИ СКОК: {symbol}\n"
+        f"Цена: ${price:.4f}"
+        + (f" ({price_change_pct:+.1f}% за последните {config.PRICE_SPIKE_PRICE_LOOKBACK_MINUTES} мин)" if price_change_pct is not None else "")
+        + "\n"
+        f"Обем последна минута: {last_minute_volume:,.0f} "
+        f"(средно предходни {config.PRICE_SPIKE_VOLUME_LOOKBACK_MINUTES} мин: {avg_prior_volume:,.0f})\n"
+        f"Dollar volume днес: ${dollar_volume:,.0f}\n"
+        "⚠️ Само наблюдение - БОТЪТ НЕ пуска поръчки - провери сам графиката/новините преди да влезеш."
+    )
+    log.info("ЦЕНОВИ СКОК:\n%s", message)
+
+    if send_telegram_message(message):
+        return True
+    if not config.ALERT_EMAIL_ENABLED:
+        return True
+    return _send_email(subject=f"[Penny Stock Scanner] {symbol} - ЦЕНОВИ СКОК", body=message)
+
+
+def _send_email(subject: str, body: str) -> bool:
+    """ВАЖНО (15.10, по реален инцидент - MWYN показваше score 100.0 в
+    Render логовете безброй цикли подред, но НИКОГА не прати email):
+    връщаната стойност тук решава дали main.py::_maybe_alert_high_potential
+    маркира тикера като "вече алъртнат" ЗАВИНАГИ (докато не излезе от
+    watchlist-а - виж notifier.can_send_now за същия принцип при anti-spam
+    темпото). Преди тук "извън разрешените часове", "Resend върна HTTP
+    грешка" и "мрежова грешка" ВСИЧКИ връщаха True ("обработено") - т.е.
+    при ВСЯКА от трите временни пречки тикерът се маркираше като алъртнат
+    ЗАВИНАГИ, въпреки че РЕАЛНО никога не е пратен email. Преди Upstash
+    (виж watchlist.py) това се "самопоправяше" случайно при всеки Render
+    рестарт (флагът се бършеше) - откакто state-ът реално персистира, бъгът
+    остава заклещен трайно (точно какво се случи с MWYN). Сега трите
+    временни случая връщат False (като anti-spam темпото) - main.py НЕ
+    маркира тикера като алъртнат и пробва пак следващия цикъл. Истинско
+    "спри да пробваш" (True) остава само когато алъртите са трайно
+    изключени/нямат ключ по конфигурация - това не е временна грешка."""
+    if not (config.RESEND_API_KEY and config.ALERT_EMAIL_TO):
+        log.warning("Email алъртите са включени, но RESEND_API_KEY или ALERT_EMAIL_TO не са попълнени.")
+        return True
+    if not _within_active_hours():
+        log.info(
+            "Извън разрешените часове за имейли (%02d:%02d-%02d:%02d %s) - пропускам email-а този цикъл "
+            "(алъртът е в логовете) - ще пробвам пак, щом сме в разрешените часове.",
+            config.ALERT_ACTIVE_START_HOUR, config.ALERT_ACTIVE_START_MINUTE,
+            config.ALERT_ACTIVE_END_HOUR, config.ALERT_ACTIVE_END_MINUTE, config.ALERT_QUIET_HOURS_TZ,
+        )
+        return False
+    if not _rate_limit_ok():
+        return False
+    try:
+        resp = requests.post(
+            RESEND_API_URL,
+            headers={
+                "Authorization": f"Bearer {config.RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": config.RESEND_FROM_EMAIL,
+                "to": [config.ALERT_EMAIL_TO],
+                "subject": subject,
+                "text": body,
+            },
+            timeout=15,
+        )
+        if resp.status_code >= 300:
+            log.error("Resend отказа изпращането (%s): %s - ще пробвам пак следващия цикъл.", resp.status_code, resp.text)
+            return False  # временна грешка (виж бележката горе) - пробваме пак, не маркираме като алъртнато
+        _mark_email_sent()
+        log.info("Email алърт изпратен до %s през Resend", config.ALERT_EMAIL_TO)
+        return True
+    except Exception as e:
+        log.error("Изпращането на email през Resend се провали: %s - ще пробвам пак следващия цикъл.", e)
+        return False  # мрежова грешка - временна, пробваме пак (виж бележката горе)

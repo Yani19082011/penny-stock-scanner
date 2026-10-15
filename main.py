@@ -291,6 +291,20 @@ def _score_symbols(symbols) -> list:
             catalyst = _has_news_catalyst(symbol, resumed_symbols)
             dilution = get_sec_dilution_flags(symbol)
             result = score_symbol(symbol, ind, catalyst, dilution)
+            # (15.10, по реален инцидент - MWYN показваше score 100.0 в
+            # логовете безброй цикли подред, без обяснение защо никога не
+            # алъртва): score>=прага, но dilution filing твърдо блокира
+            # is_high_potential (виж scoring.py::ScoreResult.is_high_potential)
+            # - преди това беше НЕВИДИМО в логовете, трябваше ръчно да се
+            # проверява SEC EDGAR, за да се разбере причината. Сега изрично
+            # лог ред, за да личи веднага следващия път.
+            if result.score >= config.HIGH_POTENTIAL_THRESHOLD and result.has_dilution_risk:
+                log.info(
+                    "%s: score %.0f достига прага за 'ВИСОК ПОТЕНЦИАЛ', НО е блокиран от скорошен "
+                    "dilution filing (S-1/S-3/424B) - няма да алъртне, докато филингът не отпадне "
+                    "от SEC EDGAR търсенето (виж get_sec_dilution_flags).",
+                    symbol, result.score,
+                )
             # (13.10) Sanity-check САМО за кандидати, които иначе биха минали
             # прага за "ВИСОК ПОТЕНЦИАЛ" - пести извиквания, не бавим целия
             # скан заради тикери, които няма да алъртнат нищо. Виж
