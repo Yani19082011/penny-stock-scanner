@@ -127,17 +127,41 @@ def get_last_regular_session_price(symbol: str) -> float | None:
     редовна-сесийна свещ е по-малко податлива на точно този вид артефакт,
     защото идва от отделна, по-фина агрегация.
 
-    Връща None при провал/липсващи данни - викащият код тогава НЕ наказва
-    алърта заради собствена мрежова грешка, просто пропуска проверката."""
+    ПОПРАВКА (13.10, по ВТОРИ реален инцидент - LNKS алърт показа $2.27,
+    докато потребителят провери графиката 2 мин по-късно и цената НИКОГА не
+    е стигала $2.27 - т.е. самата sanity-check проверка не се е задействала
+    навреме): yfinance 1-минутните данни често липсват точно за силно
+    неликвидни/слабо следени penny stocks - именно тези, които най-много се
+    нуждаят от проверка. Преди тук просто връщахме None (викащият код тогава
+    "fail-open" - пропуска проверката), без резервен опит. Сега, ако
+    yfinance върне празно/нищо, пробваме Alpaca IEX ('1Min' бар, виж
+    AlpacaClient.get_bars) като ВТОРИ независим източник, преди да се
+    откажем напълно - двата извора трудно биха имали СЪЩАТА грешка
+    едновременно. Плюс явен лог и за двата провала (преди "празно" изобщо
+    не се логваше - невъзможно беше да се диагностицира дали проверката
+    изобщо е пробвана).
+
+    Връща None само ако И ДВАТА извора не дадат данни - викащият код тогава
+    НЕ наказва алърта заради собствена мрежова грешка, просто пропуска
+    проверката (виж main.py::_price_is_sane)."""
     try:
         import yfinance as yf
         df = yf.Ticker(symbol).history(period="1d", interval="1m", prepost=False)
-        if df.empty:
-            return None
-        return float(df["Close"].iloc[-1])
+        if not df.empty:
+            return float(df["Close"].iloc[-1])
+        log.info("yfinance 1-мин sanity-check: няма данни за %s - пробвам Alpaca IEX като резерва.", symbol)
     except Exception as e:
-        log.warning("yfinance 1-мин sanity-check fail за %s: %s", symbol, e)
-        return None
+        log.warning("yfinance 1-мин sanity-check fail за %s: %s - пробвам Alpaca IEX като резерва.", symbol, e)
+
+    try:
+        alpaca_df = AlpacaClient().get_bars(symbol, timeframe="1Min", limit=1)
+        if not alpaca_df.empty:
+            return float(alpaca_df["close"].iloc[-1])
+        log.warning("Alpaca IEX резервна sanity-check проверка също върна празно за %s - проверката се пропуска.", symbol)
+    except Exception as e:
+        log.warning("Alpaca IEX резервна sanity-check проверка се провали за %s: %s - проверката се пропуска.", symbol, e)
+
+    return None
 
 
 def get_minute_bars_batch(symbols: list[str], lookback_minutes: int = 15) -> dict[str, "pd.DataFrame"]:
@@ -269,12 +293,32 @@ def get_google_news_rss(symbol: str, limit: int = 5) -> list:
 
 def get_sec_dilution_flags(symbol: str) -> dict:
     """
-    Проверка в SEC EDGAR full-text search за скорошни S-1/S-3/424B filings
+    Проверка в SEC EDGAR full-text search за СКОРОШНИ S-1/S-3/424B filings
     (класически dilution риск за penny stocks). Безплатно, без API ключ.
-    """
+
+    ПОПРАВКА (19.10, по реален инцидент - потребителят докладва "3 работни
+    дни без НИТО един email", а логовете показаха по 2-3 тикера на ден със
+    score 100, ВСИЧКИ блокирани от dilution filing): преди заявката НЯМАШЕ
+    ограничение по дата изобщо - проверяваше дали символът се среща в S-1/
+    S-3/424B5 filing от ВСИКОГА (EDGAR full-text search индексът стига до
+    2001 г.), въпреки че коментарът тук (и config.PRICE_SANITY_CHECK_*
+    стила на документация другаде в проекта) явно казва "скорошни". Почти
+    всеки penny stock има S-1 от самото си IPO или S-3 shelf registration
+    в историята си някъде - т.е. старата логика на практика блокираше
+    ПОЧТИ ВСИЧКО завинаги, не само реален активен dilution риск. Сега
+    заявката взима startdt/enddt (единствените официално документирани
+    параметри за дата на EDGAR full-text search API - виж README.md
+    бележка/коментар тук) - прозорец от config.DILUTION_LOOKBACK_DAYS назад
+    от днес. Филинг отпреди 90 дни е реален "скоро предстои dilution"
+    сигнал; филинг отпреди 3 години не е - точно разликата, която старата
+    заявка пропускаше."""
     try:
+        today = datetime.now(timezone.utc).date()
+        start = today - timedelta(days=config.DILUTION_LOOKBACK_DAYS)
         r = requests.get(
-            "https://efts.sec.gov/LATEST/search-index?q=%22{}%22&forms=S-1,S-3,424B5".format(symbol),
+            "https://efts.sec.gov/LATEST/search-index?q=%22{}%22&forms=S-1,S-3,424B5&startdt={}&enddt={}".format(
+                symbol, start.isoformat(), today.isoformat(),
+            ),
             timeout=10,
             headers={"User-Agent": "penny-stock-scanner contact@example.com"},
         )
