@@ -47,6 +47,26 @@ scoring.py (score=100), не watchlist. Другите 2 варианта от �
 (donchian_breakout_short, donchian_breakout_loose_volume) НЕ се добавят -
 по-нестабилен/по-лош риск профил между прозорците (виж strategies.py).
 
+ПРОМЯНА (03.11, по изрична молба "искам да добавим най добрата стратегия
+която намерихме"): добавен `pullback_vwap_reclaim` - находка от ОТДЕЛЕН,
+много по-голям по обхват search (mass_strategy_search.py, 269 единични
+варианта, 7 кръга, над 180 000 стратегия×изход тествания) - ЕДИНСТВЕНАТА
+комбинация покрай donchian_sustained_breakout, която издържа 3-прозоречна
+валидация във ВСИЧКИ 7 кръга (виж strategies.py::signal_pullback_vwap_
+reclaim_combo за пълната история и числа). Нуждае се от 30+25=55 бара
+история (по-малко от near_high_volume_build-ския праг от 125, затова
+външната проверка тук си остава 45 - сигналът просто СЕ пази вътрешно и
+връща False за по-къса история, същия принцип като near_high_volume_build).
+
+ПРОМЯНА (04.11, по изрична молба "добави 3 най добри стратегии"): добавени
+`bollinger_band_walk`, `pullback_volspike_combo`, `choppiness_breakout` -
+топ 3 находки по среден win_rate от mass_strategy_search.py (сега 382
+единични варианта, 13 кръга - виж пълната история в strategies.py над
+signal_bollinger_band_walk). Влизат на watchlist ниво в scoring.py (не
+"ВИСОК ПОТЕНЦИАЛ"), виж scoring.py за пълното обяснение защо. Нуждаят се
+от най-много 20+10=30 бара история (choppiness_breakout) - по-малко от
+съществуващата 45-бара проверка по-долу, затова не се налага промяна там.
+
 ЧЕСТНА бележка за живо приложение: strategies.py функциите са backtest-вани
 на ЗАТВОРЕНИ дневни свещи (walk-forward, без lookahead - виж strategy_
 backtest.py). На живо, докато пазарът е отворен, "днешният" ред от
@@ -86,4 +106,8 @@ def compute_daily_signals(df) -> dict:
         "momentum_acceleration": bool(strategies.signal_momentum_acceleration(df)),
         "near_high_volume_build": bool(strategies.signal_near_high_volume_build(df)),
         "volume_climax_reversal_2day": bool(strategies.signal_volume_climax_reversal_2day(df)),
+        "pullback_vwap_reclaim": bool(strategies.signal_pullback_vwap_reclaim_combo(df)),
+        "bollinger_band_walk": bool(strategies.signal_bollinger_band_walk(df)),
+        "pullback_volspike_combo": bool(strategies.signal_pullback_volspike_combo(df)),
+        "choppiness_breakout": bool(strategies.signal_choppiness_breakout(df)),
     }

@@ -79,6 +79,35 @@ reasons (за твоя преценка в email-а), но вече не бло�
 S-1/S-3/424B dilution filing ВСЕ ОЩЕ спира "ВИСОК ПОТЕНЦИАЛ" алърта твърдо,
 независимо от score-а - това е НЕЗАВИСИМО от коя техническа стратегия се
 ползва и защитава срещу реален документиран минал инцидент (TEAD).
+
+ПРОМЯНА (03.11, по изрична молба "искам да добавим най добрата стратегия
+която намерихме сега и също искам да пише ... чрез коя стратегия или ако
+е хванато и от двете по едно и също време да пише и от двете"): добавен
+`pullback_vwap_reclaim` (виж indicators.py/strategies.py за пълната
+история - находка от mass_strategy_search.py) на СЪЩОТО ниво като
+donchian_sustained_breakout (score=100, "ВИСОК ПОТЕНЦИАЛ" алърт/email).
+Gate-ът по-долу е сега "donchian ИЛИ pullback_vwap" (не изключващо или) -
+ако и двата сигнала гръмнат СЪЩИЯ ден за същия тикер, score-ът пак е 100,
+но `strategy_label` изрично казва "и двете". Новото поле `strategy_label`
+на ScoreResult се показва от notifier.py като отделен ред ("Стратегия:
+...") в email-а - точно кой сигнал/сигнали реално са предизвикали алърта,
+а не само в сметка на `reasons` (които продължават да носят пълното
+обяснение на всеки сигнал поотделно).
+
+ПРОМЯНА (04.11, по изрична молба "добави 3 най добри стратегии"): добавени
+`bollinger_band_walk`, `pullback_volspike_combo`, `choppiness_breakout` -
+топ 3 находки от mass_strategy_search.py (виж пълната история в
+strategies.py над signal_bollinger_band_walk и индикатора в indicators.py).
+ЧЕСТНО РЕШЕНИЕ за ниво: за разлика от pullback_vwap_reclaim (влязъл на
+ПЪЛНО ниво 100 след потвърждение във ВСИЧКИ 7 кръга на търсенето по онова
+време), и трите тук са потвърдени само в СОБСТВЕНИЯ си кръг (3 прозореца
+всеки, не препотвърдени многократно). Затова влизат на WATCHLIST ниво
+(score=55), СЪЩОТО като fib_retracement_bounce/near_high_volume_build/
+volume_climax_reversal_2day - НЕ директно "ВИСОК ПОТЕНЦИАЛ". Ако покажат
+стабилност и на живо (следи ги в email-ите за watchlist), кажи да ги
+повдигнем на пълно ниво. `choppiness_breakout` допълнително е с по-тънка
+сигнална извадка от другите две (виж strategies.py) - затова е последен
+по приоритет сред трите.
 """
 from dataclasses import dataclass, field
 
@@ -97,6 +126,12 @@ class ScoreResult:
     has_catalyst: bool = False
     has_dilution_risk: bool = False
     raw: dict = field(default_factory=dict)
+    # (03.11) Кой/кои сигнал(и) реално предизвикаха score=100 - "Donchian",
+    # "Pullback + VWAP reclaim", или "Donchian + Pullback + VWAP reclaim
+    # (хванато от ДВЕТЕ едновременно)" ако се гръмнат СЪЩИЯ ден. Празно за
+    # watchlist-ниво (score=55) резултати - там `reasons` вече обяснява
+    # всичко. Вижда се отделно в email-а (виж notifier.py::format_alert).
+    strategy_label: str = ""
 
     @property
     def is_high_potential(self) -> bool:
@@ -114,26 +149,43 @@ def score_symbol(symbol: str, ind: dict, has_news_catalyst: bool, dilution_flags
         return ScoreResult(symbol=symbol, score=0, reasons=["недостатъчно данни"])
 
     reasons = []
+    triggered_strategies = []
 
-    if ind.get("donchian_sustained_breakout"):
-        # (10.10) ПРОМЯНА: gating-ът сега е САМО на donchian_sustained_breakout,
-        # не "donchian_breakout ИЛИ sustained" - проверено (500 симулации,
-        # 0 изключения), че sustained винаги е True когато старата donchian_
-        # breakout е True (same channel/vol условие, само без "първия ден"
-        # ограничението - математическо подмножество). Старата вече не
-        # добавя НИТО ЕДИН алърт отгоре - затова излиза от gate-а. Продължава
-        # да се смята в indicators.py САМО за да различим в текста "пресен"
-        # пробив (ден 1) от "продължение" (ден 2+) - информативно за теб,
-        # не влияе на score-а.
+    # (03.11) ПРОМЯНА: gate-ът за "ВИСОК ПОТЕНЦИАЛ" сега е "donchian_
+    # sustained_breakout ИЛИ pullback_vwap_reclaim" (не изключващо или) -
+    # виж голямата бележка в началото на файла. И ДВЕТЕ се проверяват
+    # независимо, triggered_strategies пази ТОЧНО кой(и) реално гръмна(ха),
+    # за да може email-ът (notifier.py) да покаже изрично "и двете", ако
+    # се случи СЪЩИЯ ден за СЪЩИЯ тикер.
+    donchian_fired = bool(ind.get("donchian_sustained_breakout"))
+    pullback_vwap_fired = bool(ind.get("pullback_vwap_reclaim"))
+
+    if donchian_fired or pullback_vwap_fired:
+        # (10.10) ПРОМЯНА: gating-ът на самата donchian логика е САМО
+        # donchian_sustained_breakout, не "donchian_breakout ИЛИ sustained" -
+        # проверено (500 симулации, 0 изключения), че sustained винаги е
+        # True когато старата donchian_breakout е True (математическо
+        # подмножество). donchian_breakout продължава да се смята в
+        # indicators.py САМО за да различим в текста "пресен" пробив (ден 1)
+        # от "продължение" (ден 2+) - информативно, не влияе на score-а.
         score = DONCHIAN_SCORE
-        if ind.get("donchian_breakout"):
+        if donchian_fired:
+            triggered_strategies.append("Donchian")
+            if ind.get("donchian_breakout"):
+                reasons.append(
+                    "Donchian breakout: ПРЕСЕН пробив над 20-дневен връх на обем, ден 1 (виж strategies.py)"
+                )
+            else:
+                reasons.append(
+                    "Donchian sustained breakout: ПРОДЪЛЖЕНИЕ на пробив над 20-дневен връх с обем, "
+                    "не първия ден (виж strategies.py кръг 26)"
+                )
+        if pullback_vwap_fired:
+            triggered_strategies.append("Pullback + VWAP reclaim")
             reasons.append(
-                "Donchian breakout: ПРЕСЕН пробив над 20-дневен връх на обем, ден 1 (виж strategies.py)"
-            )
-        else:
-            reasons.append(
-                "Donchian sustained breakout: ПРОДЪЛЖЕНИЕ на пробив над 20-дневен връх с обем, "
-                "не първия ден (виж strategies.py кръг 26)"
+                "Pullback + VWAP reclaim: цена дръпната 10-30% от 20-дневен връх + пресичане на 30-дневна "
+                "VWAP нагоре (намерена в mass_strategy_search.py, виж strategies.py::"
+                "signal_pullback_vwap_reclaim_combo)"
             )
     else:
         watchlist_hits = []
@@ -150,6 +202,18 @@ def score_symbol(symbol: str, ind: dict, has_news_catalyst: bool, dilution_flags
             watchlist_hits.append(
                 "Volume climax reversal (2-дневно потвърждение): паник обем вчера, потвърден обрат днес без нов минимум (виж strategies.py)"
             )
+        if ind.get("bollinger_band_walk"):
+            watchlist_hits.append(
+                "Bollinger Band walk: 3 поредни затваряния над горната Bollinger лента (mass_strategy_search.py, най-стабилната находка - виж strategies.py)"
+            )
+        if ind.get("pullback_volspike_combo"):
+            watchlist_hits.append(
+                "Pullback + обемен скок: цена дръпната 20-40% от 40-дневен връх + обем >=2x 20-дневния среден (mass_strategy_search.py, виж strategies.py)"
+            )
+        if ind.get("choppiness_breakout"):
+            watchlist_hits.append(
+                "Choppiness breakout: трендиращ режим (Choppiness Index <=38.2) + пробив на 14-дневен връх (mass_strategy_search.py, виж strategies.py)"
+            )
 
         if watchlist_hits:
             score = WATCHLIST_SCORE
@@ -164,6 +228,15 @@ def score_symbol(symbol: str, ind: dict, has_news_catalyst: bool, dilution_flags
     if has_dilution_risk:
         reasons.append("⚠️ скорошен dilution filing (S-1/S-3/424B) - твърдо спира 'ВИСОК ПОТЕНЦИАЛ' алърта (виж is_high_potential)")
 
+    # (03.11) "Стратегия: ..." текст за email-а (виж notifier.py) - ако И
+    # ДВЕТЕ стратегии са гръмнали СЪЩИЯ ден за СЪЩИЯ тикер, изрично пише
+    # "и двете" по изричната молба на потребителя.
+    strategy_label = ""
+    if len(triggered_strategies) == 2:
+        strategy_label = " + ".join(triggered_strategies) + " (хванато ОТ ДВЕТЕ стратегии едновременно)"
+    elif len(triggered_strategies) == 1:
+        strategy_label = triggered_strategies[0]
+
     return ScoreResult(
         symbol=symbol,
         score=score,
@@ -171,4 +244,5 @@ def score_symbol(symbol: str, ind: dict, has_news_catalyst: bool, dilution_flags
         has_catalyst=has_news_catalyst,
         has_dilution_risk=has_dilution_risk,
         raw=ind,
+        strategy_label=strategy_label,
     )

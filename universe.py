@@ -39,8 +39,22 @@ Universe-ът вече е изграден така:
 
 Ако и FMP, и StockAnalysis, и halts не върнат нищо в диапазона, пада на
 статичен FALLBACK_UNIVERSE (грубо, потенциално остаряло - виж бележката там).
+
+ПРОМЯНА (04.11, по изрична молба "махни 3x leverage и всякакви подобни само
+обикновени акции без 3x 2x и подобни"): добавен филтър за ЛИВЪРИДЖ/ИНВЕРСНИ
+ETF-и (SOXL, TQQQ, LABU и т.н.) - те могат да изпъкнат в gainers/losers/
+most-actives списъците точно заради вградения си 2x/3x множител, не заради
+реална спекулативна волатилност на малка компания, и НЕ са "обикновени
+акции" по дух на потребителя. Филтърът е двоен: статичен LEVERAGED_ETF_
+BLOCKLIST с познати тикери (бърз, сигурен) + regex по името на инструмента
+(_LEVERAGED_NAME_RE, напр. "Direxion Daily ... Bull 3X Shares",
+"ProShares UltraPro...") за случаи извън статичния списък. Приложен навсякъде,
+където кандидати влизат в universe-а: FMP movers, StockAnalysis.com movers
+(get_universe + get_volume_snapshot) и наскоро-възобновените halt тикери
+(през issuer_name).
 """
 import logging
+import re
 import time
 
 import requests
@@ -69,6 +83,45 @@ LARGE_CAP_BLOCKLIST = {
     "SNAP", "PINS", "UBER", "LYFT", "PYPL", "RIVN", "COIN",
     "HOOD", "DKNG", "CHPT", "OPEN", "AFRM", "MRVL",
 }
+
+# Познати ЛИВЪРИДЖ/ИНВЕРСНИ ETF-и (2x/3x "Bull"/"Bear"/"Ultra"/"Daily
+# Target" и подобни) - различен тип инструмент от истински penny stock
+# (движат се 2-3 пъти по конструкция, не заради фундаментална волатилност на
+# малка компания). Твърд статичен backup + regex филтър по име по-долу (виж
+# _is_leveraged_etf) - движещите се екрани понякога връщат имена, които
+# издават ливъридж директно дори за тикери извън този списък.
+LEVERAGED_ETF_BLOCKLIST = {
+    "SOXL", "SOXS", "TQQQ", "SQQQ", "LABU", "LABD", "TNA", "TZA", "FAS",
+    "FAZ", "SPXL", "SPXS", "UPRO", "SPXU", "UVXY", "SVXY", "SVIX", "TSLL",
+    "TSLQ", "TSLS", "TSLR", "BOIL", "KOLD", "YINN", "YANG", "JNUG", "JDST",
+    "NUGT", "DUST", "GUSH", "DRIP", "CURE", "RXL", "NVDL", "NVDS", "NVDQ",
+    "NVD", "AAPU", "AAPD", "MSFU", "MSFD", "AMZU", "AMZD", "GGLL", "GGLS",
+    "METU", "METD", "CONL", "FNGU", "FNGD", "WEBL", "WEBS", "TMF", "TMV",
+    "UDOW", "SDOW", "URTY", "SRTY", "UMDD", "SMDD", "ERX", "ERY", "DPST",
+    "MIDU", "MIDZ", "UCO", "SCO", "UGL", "GLL", "AGQ", "ZSL", "BNKU", "BNKD",
+    "FXI3", "YCL", "YCS",
+}
+
+# Хваща имена на инструменти, които се самоопределят като ливъридж/инверсни
+# (StockAnalysis/FMP movers понякога връщат полето "name" дори за тикери,
+# които не са в статичния списък по-горе - напр. нов фонд).
+_LEVERAGED_NAME_RE = re.compile(
+    r"(?:\b[123](?:\.5)?X\b|ULTRAPRO|ULTRA\s*PRO|\bULTRA\b|LEVERAGED|"
+    r"INVERSE|DAILY\s+(?:BULL|BEAR)|DAILY\s+TARGET|DIREXION\s+DAILY|"
+    r"PROSHARES\s+(?:ULTRA|SHORT)|GRANITESHARES|T-REX)",
+    re.IGNORECASE,
+)
+
+
+def _is_leveraged_etf(symbol: str, name: str | None = None) -> bool:
+    """True за познат (или по име разпознаваем) 2x/3x ливъридж или инверсен
+    ETF/ETN - виж ПРОМЯНА (04.11) в docstring-а на модула по-горе."""
+    if symbol in LEVERAGED_ETF_BLOCKLIST:
+        return True
+    if name and _LEVERAGED_NAME_RE.search(name):
+        return True
+    return False
+
 
 FALLBACK_UNIVERSE = [
     s for s in ["PLUG", "FCEL", "BBIG", "CLOV", "SNDL", "GSAT", "CIDM", "IDEX"]
@@ -182,6 +235,8 @@ def get_volume_snapshot() -> dict:
                 continue
             if symbol in LARGE_CAP_BLOCKLIST or price > config.MAX_UNIVERSE_PRICE:
                 continue
+            if _is_leveraged_etf(symbol, row.get("name")):
+                continue
             snapshot[symbol] = {
                 "price": price,
                 "change_pct": row.get("change_pct"),
@@ -256,6 +311,8 @@ def get_universe() -> list[str]:
             continue
         if symbol in LARGE_CAP_BLOCKLIST or price > config.MAX_UNIVERSE_PRICE:
             continue
+        if _is_leveraged_etf(symbol, row.get("name")):
+            continue
         candidates[symbol] = row
 
     for slug in STOCKANALYSIS_SLUGS:
@@ -265,6 +322,8 @@ def get_universe() -> list[str]:
             if not symbol or price is None:
                 continue
             if symbol in LARGE_CAP_BLOCKLIST or price > config.MAX_UNIVERSE_PRICE:
+                continue
+            if _is_leveraged_etf(symbol, row.get("name")):
                 continue
             candidates[symbol] = row
             if row.get("market_cap"):
@@ -305,7 +364,11 @@ def get_universe() -> list[str]:
     # третира и като catalyst сами по себе си (_has_news_catalyst).
     resumed_symbols = []
     try:
-        resumed_symbols = [s for s in get_recently_resumed().keys() if s not in LARGE_CAP_BLOCKLIST]
+        resumed_symbols = [
+            s for s, info in get_recently_resumed().items()
+            if s not in LARGE_CAP_BLOCKLIST
+            and not _is_leveraged_etf(s, (info or {}).get("issuer_name"))
+        ]
         if resumed_symbols:
             log.info("Наскоро възобновени след halt тикери (допълнителни кандидати): %s", resumed_symbols)
     except Exception as e:

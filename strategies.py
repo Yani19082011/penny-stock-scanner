@@ -3134,6 +3134,222 @@ def signal_donchian_close_channel_breakout(df: pd.DataFrame, channel_period: int
 # по-къс брат ѝ отхвърлен, другите 2 кръг-27 кандидата по-слаби) остава
 # финалният шампион от цялото търсене за "по-чест donchian" - добавя се в
 # живия бот.
+
+# === mass_strategy_search.py НАХОДКА (03.11, по изрична молба "искам да
+# добавим най добрата стратегия която намерихме"): отделен, МНОГО по-
+# голям по обхват search (269 единични варианта, ~36 000 комбинации, 7
+# кръга, над 180 000 стратегия×изход тествания - виж mass_strategy_
+# search.py за пълната история) намери ТОЧНО ЕДНА комбинация, която
+# издържа 3-прозоречна (--offset-days 250/500) out-of-sample валидация
+# във ВСИЧКИ 7 кръга: pullback_w20_0.1_0.3 (10-30% дръпване от 20-дневен
+# връх на ЗАТВАРЯНЕ, не high - различно от pullback_to_rising_ma) И
+# vwap_reclaim_w30 (пресичане на 30-дневна VWAP, претеглена с TYPICAL
+# PRICE (high+low+close)/3, не само close като съществуващата по-горе
+# signal_vwap_reclaim) - ЕДНОВРЕМЕННО същия ден (AND, не ИЛИ едната). По
+# метриката hit_target_10pct_close_5d_% (колко често РЕАЛНО излизаш на
+# +10% или повече - точно целта на потребителя "давай искам ... да
+# излизам на 10 процента печалба и повече"): 63.2%/64.3%/48.4% срещу
+# random_baseline 29.4%/38.6%/29.2% в първите 5 кръга - по-добра и по-
+# последователна от живата donchian_sustained_breakout (33.3%/45.3%/
+# 31.8% в СЪЩИТЕ прозорци). ЧЕСТНА бележка: в кръг 6-7 (след universe-ът
+# се е обновил) числата паднаха до 55.0%/61.0%/44.4% - все още над
+# baseline, но с видимо по-малка сигурност. Добавя се тук на СЪЩОТО ниво
+# като donchian_sustained_breakout (виж scoring.py) - вторият живи сигнал
+# на бота, а не замяна.
+
+
+def signal_pullback_mean_reversion(df: pd.DataFrame, window: int = 20, pullback_lo: float = 0.10, pullback_hi: float = 0.30, min_bars: int = 5) -> bool:
+    """Pullback mean-reversion отскок: цената е дръпнала се pullback_lo-
+    pullback_hi (10%-30% по подразбиране) от своя `window`-дневен връх на
+    ЗАТВАРЯНЕ (max CLOSE, не high - виж mass_strategy_search.py build_
+    signal_library #7 "pullback"), и ДНЕС е първи зелен ден (close > close
+    вчера). Самостоятелно семейство от mass_strategy_search.py (виж
+    бележката по-горе) - ЧАСТ от единствения допълнителен потвърден
+    survivor (виж signal_pullback_vwap_reclaim_combo по-долу), не се
+    ползва самостоятелно в scoring.py."""
+    min_len = window + min_bars
+    if len(df) < min_len:
+        return False
+    close = df["close"]
+    roll_max = close.rolling(window).max().shift(1)
+    prior_high = roll_max.iloc[-1]
+    if not prior_high or prior_high != prior_high:  # None/NaN проверка
+        return False
+    today_close = close.iloc[-1]
+    pullback_pct = (prior_high - today_close) / prior_high
+    if not (pullback_lo <= pullback_pct <= pullback_hi):
+        return False
+    yesterday_close = close.iloc[-2]
+    return bool(today_close > yesterday_close)
+
+
+def signal_vwap_reclaim_typical_price(df: pd.DataFrame, period: int = 30, min_bars: int = 25) -> bool:
+    """VWAP reclaim с TYPICAL PRICE тежест ((high+low+close)/3) - различна,
+    по-точна формула от съществуващата signal_vwap_reclaim по-горе (която
+    тежи само по close, period=20 по подразбиране там). Това е ТОЧНО
+    "vwap_reclaim_w30" варианта от mass_strategy_search.py build_signal_
+    library #24 (кръг 3): rolling обемно-претеглена типична цена за
+    последните `period` дни, сигнал когато вчера затварянето е било под
+    тази VWAP линия, днес е над нея. ЧАСТ от единствения допълнителен
+    потвърден survivor (виж signal_pullback_vwap_reclaim_combo по-долу)."""
+    min_len = period + min_bars
+    if len(df) < min_len:
+        return False
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3
+    pv = typical_price * df["volume"]
+    vwap = pv.rolling(period).sum() / df["volume"].rolling(period).sum()
+    if len(vwap) < 2:
+        return False
+    today_vwap, yesterday_vwap = vwap.iloc[-1], vwap.iloc[-2]
+    if today_vwap != today_vwap or yesterday_vwap != yesterday_vwap:  # NaN проверка
+        return False
+    close = df["close"]
+    today_close, yesterday_close = close.iloc[-1], close.iloc[-2]
+    return bool(yesterday_close <= yesterday_vwap and today_close > today_vwap)
+
+
+def signal_pullback_vwap_reclaim_combo(df: pd.DataFrame) -> bool:
+    """ЕДИНСТВЕНАТА, покрай donchian_sustained_breakout, находка от
+    mass_strategy_search.py (виж голямата бележка по-горе за пълния
+    контекст), която издържа 3-прозоречна валидация във ВСИЧКИ 7 кръга:
+    signal_pullback_mean_reversion (10-30% дръпване от 20-дневен връх на
+    затваряне) И signal_vwap_reclaim_typical_price (пресичане на 30-дневна
+    VWAP) - ЕДНОВРЕМЕННО СЪЩИЯ ден (AND, не ИЛИ двете поотделно - точно
+    комбинацията "pullback_w20_0.1_0.3+vwap_reclaim_w30", не двата единични
+    сигнала сами). Добавена в scoring.py на СЪЩОТО ниво като donchian_
+    sustained_breakout (03.11, по изрична молба "искам да добавим най
+    добрата стратегия която намерихме")."""
+    return bool(
+        signal_pullback_mean_reversion(df, window=20, pullback_lo=0.10, pullback_hi=0.30)
+        and signal_vwap_reclaim_typical_price(df, period=30)
+    )
+
+
+# ПРОМЯНА (04.11, по изрична молба "оправи всичко от по рано ... и добави
+# 3 най добри стратегии"): добавени ОЩЕ 3 находки от mass_strategy_
+# search.py (виж пълната история на търсенето - 13 кръга, 382 единични
+# варианта, над 360 000 стратегия×изход тествания) - топ 3 по СРЕДЕН
+# win_rate_close_5d_% през 3-прозоречна валидация (--days 250/--offset-
+# days 250/500), ВСЕКИ бие ЗАДЪЛЖИТЕЛНО и donch_h_w20_v1.5, и
+# random_baseline във ВСИЧКИТЕ 3 прозореца по win_rate:
+#
+#   1) signal_bollinger_band_walk (bbwalk_n3, кръг 8) - 47.6/57.5/55.6%,
+#      средно ~53.6% - НАЙ-стабилната находка в mass_strategy_search.py,
+#      препотвърдена ОЩЕ 2 пъти на допълнителни прозорци в кръгове 9-10
+#      (60.0/51.2% и 51.2%) - 5 независими изпълнения общо, никога не е
+#      паднала под baseline.
+#   2) signal_pullback_volspike_combo (pullback_w40_0.2_0.4+volspike_
+#      w20_v2.0, кръг 1-2 - ПЪРВАТА находка в цялата сесия) - 42.0/66.7/
+#      50.0%, средно ~52.9%. РАЗЛИЧНА комбинация от вече живия pullback_
+#      vwap_reclaim_combo - по-дълбок pullback (20-40% от 40-дневен връх,
+#      не 10-30% от 20-дневен) + обемен скок (volspike), не VWAP пресичане.
+#   3) signal_choppiness_breakout (chopbreak_n14, кръг 12) - 48.7/52.9/
+#      52.9%, средно ~51.5%, ЕДИНСТВЕНАТА от трите с ПОЛОЖИТЕЛНА
+#      avg_ret_targetsim_close_5d_% и в трите прозореца (+0.44/+0.81/
+#      +0.23%). ЧЕСТНА бележка: по-тънка извадка от другите две (34-85
+#      сигнала на прозорец срещу 100+ за bbwalk/pullback_volspike).
+#
+# ЧЕСТНО РЕШЕНИЕ за ниво в scoring.py: за разлика от pullback_vwap_
+# reclaim_combo (влязъл на пълно ниво 100 след потвърждение във ВСИЧКИ 7
+# кръга на търсенето по онова време), и трите тук са потвърдени само в
+# СОБСТВЕНИЯ си кръг (3 прозореца всеки, не препотвърдени многократно като
+# pullback_vwap). Затова влизат на watchlist ниво (score=55), СЪЩОТО като
+# fib_retracement_bounce/near_high_volume_build/volume_climax_reversal_
+# 2day - не директно "ВИСОК ПОТЕНЦИАЛ" (100). Ако покажат стабилност и
+# на живо, могат да се повишат по-късно (виж scoring.py за пълната
+# бележка). Отхвърлени кандидати от същото търсене, НЕ добавени тук:
+# three_outside_up и donchpos_w20/w40 (и двата изглеждаха 2/2 силни, но
+# се провалиха във 3-ти прозорец - класически multiple-testing шум, виж
+# mass_strategy_search.py докстринга за пълните числа).
+
+
+def signal_bollinger_band_walk(df: pd.DataFrame, period: int = 20, k: float = 2.0, consecutive_days: int = 3, min_bars: int = 10) -> bool:
+    """Bollinger Band "walk" (bbwalk_n3 в mass_strategy_search.py, кръг 8)
+    - `consecutive_days` ПОРЕДНИ затваряния НАД горната Bollinger лента
+    (SMA(period) + k*std(period)) - continuation сила ЧРЕЗ БРОЙ поредни
+    дни, не единичен кросоувър (различно от bbsqueeze/%B реклейм, които
+    гледат само ДЕНЯ на пробива). НАЙ-стабилната находка в mass_strategy_
+    search.py - вижте бележката по-горе за пълната история на
+    потвържденията (5 независими изпълнения, 3 различни кръга)."""
+    min_len = period + min_bars
+    if len(df) < min_len:
+        return False
+    close = df["close"]
+    ma = close.rolling(period).mean()
+    std = close.rolling(period).std()
+    upper = ma + k * std
+    above = close > upper
+    tail = above.iloc[-consecutive_days:]
+    if len(tail) < consecutive_days or tail.isna().any():
+        return False
+    return bool(tail.all())
+
+
+def signal_volume_spike(df: pd.DataFrame, window: int = 20, vol_mult: float = 2.0, min_bars: int = 5) -> bool:
+    """Чист обемен скок (volspike_w20_v2.0 в mass_strategy_search.py,
+    семейство #3, кръг 1) - днешният обем >= `vol_mult` x средния обем от
+    предходните `window` дни (БЕЗ изискване за пробив на нова цена, само
+    "не е червен ден"). ЧАСТ от signal_pullback_volspike_combo по-долу -
+    не се ползва самостоятелно в scoring.py."""
+    min_len = window + min_bars
+    if len(df) < min_len:
+        return False
+    vol = df["volume"]
+    prior_vol_mean = vol.iloc[-(window + 1):-1].mean()
+    if not prior_vol_mean or prior_vol_mean != prior_vol_mean:
+        return False
+    today_vol = vol.iloc[-1]
+    close = df["close"]
+    today_close, yesterday_close = close.iloc[-1], close.iloc[-2]
+    return bool(today_vol >= vol_mult * prior_vol_mean and today_close > yesterday_close)
+
+
+def signal_pullback_volspike_combo(df: pd.DataFrame) -> bool:
+    """pullback_w40_0.2_0.4+volspike_w20_v2.0 (mass_strategy_search.py) -
+    ПЪРВАТА находка в цялата mass-search сесия (кръг 1-2): цена дръпнала
+    се 20-40% от своя 40-дневен връх на затваряне (signal_pullback_mean_
+    reversion с window=40, по-ДЪЛБОК pullback от живия pullback_vwap_
+    reclaim_combo който ползва 10-30% от 20-дневен връх) И обемен скок
+    >=2x 20-дневния среден обем (signal_volume_spike) - ЕДНОВРЕМЕННО
+    СЪЩИЯ ден (AND). Виж голямата бележка над signal_bollinger_band_walk
+    за пълната история на потвържденията."""
+    return bool(
+        signal_pullback_mean_reversion(df, window=40, pullback_lo=0.20, pullback_hi=0.40)
+        and signal_volume_spike(df, window=20, vol_mult=2.0)
+    )
+
+
+def signal_choppiness_breakout(df: pd.DataFrame, period: int = 14, chop_threshold: float = 38.2, min_bars: int = 10) -> bool:
+    """Choppiness Index "трендиращ" режим + пробив (chopbreak_n14 в
+    mass_strategy_search.py, кръг 12) - логаритмично съотношение
+    log10(сума(True Range, period) / диапазон(period)) / log10(period) -
+    СТАНДАРТНАТА Choppiness Index формула (ниски стойности = трендиращ
+    пазар, високи = sideways/chop). Сигнал: ВЧЕРА индексът е бил <=
+    `chop_threshold` (стандартния праг 38.2 - "трендиращ" регистър) И
+    ДНЕС цената пробива над предходния `period`-дневен връх на
+    затваряне. ЕДИНСТВЕНАТА от трите нови находки тук с ПОЛОЖИТЕЛНА
+    средна симулирана доходност и в трите валидационни прозореца - виж
+    голямата бележка над signal_bollinger_band_walk. ЧЕСТНА бележка:
+    по-тънка извадка от другите две нови находки."""
+    min_len = period + min_bars + 1
+    if len(df) < min_len:
+        return False
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = pd.concat([
+        high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    sum_tr = tr.iloc[-(period + 1):-1].sum()
+    range_hl = high.iloc[-(period + 1):-1].max() - low.iloc[-(period + 1):-1].min()
+    if not range_hl or range_hl != range_hl or sum_tr <= 0:
+        return False
+    chop_yesterday = 100 * np.log10(sum_tr / range_hl) / np.log10(period)
+    if chop_yesterday != chop_yesterday or chop_yesterday > chop_threshold:
+        return False
+    prior_high_close = close.iloc[-(period + 1):-1].max()
+    today_close = close.iloc[-1]
+    return bool(today_close > prior_high_close)
+
+
 STRATEGIES = {
     "pocket_pivot": signal_pocket_pivot,
     "nr7_squeeze": signal_nr7_volatility_squeeze,
@@ -3215,4 +3431,11 @@ STRATEGIES = {
     "donchian_sustained_breakout_short": signal_donchian_sustained_breakout_short,
     "donchian_breakout_median_volume": signal_donchian_breakout_median_volume,
     "donchian_close_channel_breakout": signal_donchian_close_channel_breakout,
+    "pullback_mean_reversion_w20": signal_pullback_mean_reversion,
+    "vwap_reclaim_typical_w30": signal_vwap_reclaim_typical_price,
+    "pullback_vwap_reclaim_combo": signal_pullback_vwap_reclaim_combo,
+    "bollinger_band_walk": signal_bollinger_band_walk,
+    "volume_spike_w20_v2": signal_volume_spike,
+    "pullback_volspike_combo": signal_pullback_volspike_combo,
+    "choppiness_breakout_n14": signal_choppiness_breakout,
 }
